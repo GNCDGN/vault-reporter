@@ -1,3 +1,4 @@
+
 You are generating a monthly briefing report for a personal knowledge vault (Obsidian second brain).
 
 The vault belongs to Genco, Director of Redriff (a UK digital marketing company), based in London.
@@ -92,15 +93,35 @@ After the full report, output this EXACT separator on its own line:
 
 ---QUESTIONS_JSON---
 
-Then output a JSON object:
+Then output a JSON object with the schema below.
+
+For Genco's voice and the anti-patterns to avoid:
+
+{VOICE_SPEC}
+
+---
+
+## JSON schema
 
 ```json
 {
-  "summary": "Two sentences maximum. What this month was about. Written for a WhatsApp notification.",
+  "summary": "Two sentences. Factual. Kept for back-compat.",
+  "messages": {
+    "greeting": "The opening Telegram message that arrives with the monthly PDF. 3-5 sentences — monthly is the bigger report, the greeting can run slightly longer. Monthly arrives mid-morning, NOT at dawn — open with something like '{Month} monthly's ready' or 'May's wrap is in', NOT 'Morning —'. Names what kind of month it was, surfaces the one or two big things, gestures at the questions to come if any (monthly questions tend to be higher-stakes — pause-or-resume decisions, insights worth promoting to Galaxy, strategic reads). Read the voice spec carefully.",
+    "no_questions_signoff": "Used when questions is empty. One sentence acknowledging the month had clean signal. Written fresh.",
+    "completion_clean": "Must include literal {written}.",
+    "completion_partial": "Must include {written}, {total}, {failed}.",
+    "completion_total_fail": "Must include {total}.",
+    "early_end": "Must include {written} and {total}.",
+    "early_end_zero": "No placeholders.",
+    "cancel": "One sentence.",
+    "status_idle": "Mention next scheduled times naturally."
+  },
   "questions": [
     {
-      "text": "The question",
-      "hint": "(context hint)",
+      "framing": "Natural-language question. Monthly questions are higher-stakes — they ask Genco to make a real call. The framing should respect that. Example: 'prediction-markets-system has now been idle 35 days across the whole month. That's well past the point where it counts as drift. Pause it formally, or restart with a small concrete step this week?'",
+      "text": "Bare question.",
+      "hint": "Empty string or back-compat hint.",
       "vault_write": {
         "file": "relative/path/to/file.md",
         "section": "Section heading or null",
@@ -115,8 +136,10 @@ Then output a JSON object:
 Generate 0–5 questions. Monthly questions should be higher-stakes than weekly ones:
 - Projects that were idle all month needing a pause/resume decision
 - Insights that should become Galaxy notes but weren't
-- Strategic questions about direction (e.g. "Redriff had no vault-visible progress for the third month — is there a structural reason for this?")
+- Strategic questions about direction
 - Anything that requires user input to be properly logged
+
+All `messages` fields are REQUIRED.
 
 ---
 

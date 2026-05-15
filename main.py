@@ -1,28 +1,25 @@
 #!/usr/bin/env python3
 """
 main.py
+
 Orchestrator for the vault reporting system.
-Ties together: context building → report generation → WhatsApp delivery.
+Ties together: context building → report generation → Telegram delivery.
 
 Usage:
-  python main.py weekly              # Generate and deliver weekly report
-  python main.py daily               # Generate and deliver daily report
-  python main.py monthly             # Generate and deliver monthly report
-  python main.py weekly --dry-run    # Build context + show preview, no API calls
-  python main.py weekly --no-send    # Generate report but don't send WhatsApp
-
-Phase 1 (current): report generation only.
-Phase 4+: WhatsApp delivery is enabled via --send flag or by default.
+    python main.py weekly              # Generate and deliver weekly report
+    python main.py daily               # Generate and deliver daily report
+    python main.py monthly             # Generate and deliver monthly report
+    python main.py weekly --dry-run    # Build context, print preview, no API calls
+    python main.py weekly --no-send    # Generate report but skip Telegram delivery
 """
 
 import os
 import sys
 import json
 import logging
-from datetime import datetime
 from pathlib import Path
 
-# ── Logging setup ─────────────────────────────────────────────────────────────
+# ── Logging setup ────────────────────────────────────────────────────────────
 
 LOG_FILE = os.environ.get("LOG_FILE", os.path.expanduser("~/vault-reporter.log"))
 
@@ -36,39 +33,11 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-
-# ── Phase detection ───────────────────────────────────────────────────────────
-
-def whatsapp_available() -> bool:
-    """Check if Twilio credentials are configured (Phase 4+)."""
-    return bool(os.environ.get("TWILIO_ACCOUNT_SID"))
-
-
-# ── WhatsApp stub (Phase 4 — not yet implemented) ─────────────────────────────
-
-def send_whatsapp_report(result: dict):
-    """
-    Phase 4: Send the report via WhatsApp.
-    Currently a stub — prints what would be sent.
-    """
-    log.info("[whatsapp] STUB — would send:")
-    log.info(f"[whatsapp] Summary: {result.get('summary', '')}")
-    log.info(f"[whatsapp] Report PDF: {result.get('report_path', '')}")
-    questions = result.get("questions", [])
-    if questions:
-        log.info(f"[whatsapp] Would ask {len(questions)} questions:")
-        for i, q in enumerate(questions, 1):
-            log.info(f"[whatsapp]   Q{i}: {q['text']}")
-    else:
-        log.info("[whatsapp] No questions to ask.")
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
     args = sys.argv[1:]
 
-    # Parse arguments
     report_type = None
     dry_run = False
     no_send = False
@@ -89,10 +58,8 @@ def main():
     log.info(f"Vault: {os.environ.get('VAULT_PATH', '~/vaults/second-brain')}")
     log.info(f"Dry run: {dry_run}")
 
-    # Import here so errors surface clearly
     from report_generator import generate_report
 
-    # Generate the report
     try:
         result = generate_report(report_type, dry_run=dry_run)
     except Exception as e:
@@ -105,34 +72,42 @@ def main():
 
     log.info(f"Report generated: {result['report_path']}")
     log.info(f"Summary: {result['summary']}")
+    log.info(f"Greeting: {result['messages'].get('greeting', '')[:120]}")
     log.info(f"Questions: {len(result.get('questions', []))}")
 
-    # WhatsApp delivery (Phase 4+)
+    # Telegram delivery
     if no_send:
-        log.info("--no-send flag set. Skipping WhatsApp delivery.")
-    elif whatsapp_available():
-        log.info("Twilio configured — sending via WhatsApp...")
-        send_whatsapp_report(result)
+        log.info("--no-send flag set. Skipping Telegram delivery.")
     else:
-        log.info("Twilio not configured (Phase 1/2/3). Skipping WhatsApp delivery.")
-        log.info("Report is written to vault and committed to GitHub.")
+        try:
+            from telegram_sender import telegram_configured, deliver_report
+        except ImportError as e:
+            log.error(f"Could not import telegram_sender: {e}")
+            telegram_configured = lambda: False  # noqa: E731
 
-    # Print questions to terminal so you can see what would be asked
+        if telegram_configured():
+            log.info("Telegram configured — delivering report...")
+            vault_path = Path(os.path.expanduser(
+                os.environ.get("VAULT_PATH", "~/vaults/second-brain")
+            ))
+            try:
+                deliver_report(result, vault_path)
+            except Exception as e:
+                log.error(f"Telegram delivery failed: {e}", exc_info=True)
+        else:
+            log.info("Telegram not configured. Report is in the vault on GitHub.")
+
+    # Terminal summary for manual runs
     questions = result.get("questions", [])
-    if questions:
-        print("\n" + "="*60)
-        print("QUESTIONS THAT WOULD BE ASKED VIA WHATSAPP:")
-        print("="*60)
-        for i, q in enumerate(questions, 1):
-            print(f"\nQ{i}: {q['text']}")
-            print(f"     {q.get('hint', '')}")
-            print(f"     → Write to: {q['vault_write']['file']} "
-                  f"[{q['vault_write']['mode']}]")
-    else:
-        print("\nNo questions to ask — vault has full signal.")
-
     print(f"\n{'='*60}")
     print(f"Done. Report at: {result['report_path']}")
+    if questions:
+        print(f"{len(questions)} question(s) queued for Telegram session.")
+        for i, q in enumerate(questions, 1):
+            framing = q.get("framing") or q.get("text") or "(missing)"
+            print(f"  Q{i}: {framing[:100]}")
+    else:
+        print("No questions — vault had full signal.")
     print(f"{'='*60}\n")
 
 
