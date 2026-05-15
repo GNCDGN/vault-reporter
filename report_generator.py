@@ -264,8 +264,9 @@ def generate_report(report_type: str, dry_run: bool = False) -> dict:
         raise ValueError(f"Invalid report type: {report_type}")
 
     # Build the context block (the existing context_builder owns this)
-    from context_builder import build_context
-    context = build_context(report_type)
+    from context_builder import build_context, context_to_markdown
+    context_dict = build_context(report_type)
+    context = context_to_markdown(context_dict)
 
     # Assemble the prompt
     prompt = load_prompt(report_type, context)
