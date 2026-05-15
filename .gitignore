@@ -1,0 +1,6 @@
+.env
+*.pyc
+__pycache__/
+.vault-reporter-state.json
+*.log
+.DS_Store
