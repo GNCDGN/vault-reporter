@@ -64,7 +64,8 @@ NOISE_FOLDERS = {
 }
 
 # Hard limits
-MAX_SELECTED_FILES = 10           # cap on stage-1 output
+MAX_SELECTED_FILES = 5            # was 10 pre-2026-05-16; trimmed to halve stage 2 prompt mass
+MAX_SELECTED_FILES_TOTAL_CHARS = 120_000  # soft total cap across selected files (Phase 3 prep)
 CHAT_CLAUDE_TIMEOUT = 60          # per-stage timeout, seconds
 MAX_FILE_CONTENT_CHARS = 50_000   # safety cap per file in stage 2
 GIT_PULL_TIMEOUT = 15             # seconds
