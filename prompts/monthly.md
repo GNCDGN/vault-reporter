@@ -11,6 +11,8 @@ Below is a structured context block containing:
 - The four weekly reports in this month's window
 - The previous monthly report (for delta computation)
 
+**Note on checkpoints:** the weekly reports in your window have already synthesised each week's narrative from the dailies, which in turn synthesised the checkpoints. You should NOT read raw checkpoint files for this monthly. Read the weeklies; they carry the story forward. The monthly's job is to abstract the month from the weeklies, not to re-do the daily's synthesis work.
+
 ---
 
 ## Your task

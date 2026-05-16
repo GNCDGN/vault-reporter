@@ -114,7 +114,6 @@ def get_git_log(since: str) -> list[dict]:
 
     commits = []
     current = None
-
     for line in log_output.splitlines():
         if line.startswith("COMMIT|"):
             if current:
@@ -319,7 +318,6 @@ def read_daily_notes(since: str, until: str = None) -> list[dict]:
 
     notes = []
     daily_path = VAULT_PATH / DAILY_NOTES_FOLDER
-
     if not daily_path.exists():
         return notes
 
@@ -503,6 +501,25 @@ def build_context(report_type: str) -> dict:
     print(f"[context_builder]   Spanish: {spanish_metrics['hours_in_window']}h "
           f"/ {spanish_metrics['target_hours']}h target")
 
+    # Checkpoints — the *why* behind each change. Daily reads them as the
+    # primary source for its narrative; weekly and monthly don't read them
+    # directly (they read dailies, which have already integrated the
+    # checkpoints into a narrative).
+    checkpoints = []
+    if report_type == "daily":
+        print("[context_builder] Reading active checkpoints...")
+        try:
+            from checkpoint_archiver import read_active_checkpoints
+            checkpoints = read_active_checkpoints(since, now)
+            print(f"[context_builder]   Found {len(checkpoints)} active checkpoint(s) in window")
+        except ImportError:
+            # If the archiver module isn't deployed yet, log and continue
+            # without checkpoints — graceful degradation
+            print("[context_builder]   (checkpoint_archiver not available; skipping)")
+    else:
+        print(f"[context_builder] Skipping checkpoints for {report_type} "
+              f"(this tier reads from the tier above)")
+
     # Previous report
     print("[context_builder] Reading previous report...")
     previous_report = read_previous_report(report_type)
@@ -523,6 +540,7 @@ def build_context(report_type: str) -> dict:
         "redriff_area": redriff_area,
         "daily_notes": daily_notes,
         "spanish_metrics": spanish_metrics,
+        "checkpoints": checkpoints,
         "previous_report": previous_report,
     }
 
@@ -562,6 +580,57 @@ def context_to_markdown(context: dict) -> str:
             lines.append(f"- {f}")
         lines.append("")
 
+    # Checkpoints — the *why* behind each change. The daily prompt is
+    # instructed to use these as the primary source for narrative; the AI
+    # weaves them into a story rather than describing the file diffs
+    # mechanically. If checkpoints are missing for Git changes, that's an
+    # invariant violation worth flagging in the report.
+    if "checkpoints" in context:
+        lines.append("## Checkpoints in this window")
+        if context["checkpoints"]:
+            lines.append(
+                f"Found {len(context['checkpoints'])} checkpoint note(s) in "
+                f"`01-Projects/second-brain/checkpoints/active/`. These describe "
+                f"the *intent* behind each vault change in chronological order. "
+                f"Use them as the PRIMARY source for the 'What happened' "
+                f"narrative; the git log shows what files changed, the "
+                f"checkpoints explain why."
+            )
+            lines.append("")
+            for cp in context["checkpoints"]:
+                lines.append(f"### {cp['date']} {cp['time']} — {cp['title']}")
+                lines.append(f"- Source: `{cp['source']}`")
+                lines.append(f"- Project: `{cp['project']}`")
+                if cp["files_touched"]:
+                    lines.append(f"- Files touched:")
+                    for f in cp["files_touched"]:
+                        lines.append(f"  - `{f}`")
+                lines.append(f"- Checkpoint file: `{cp['path']}`")
+                lines.append("")
+                if cp["what_changed"]:
+                    lines.append("**What changed:**")
+                    lines.append(cp["what_changed"])
+                    lines.append("")
+                if cp["why"]:
+                    lines.append("**Why:**")
+                    lines.append(cp["why"])
+                    lines.append("")
+                if cp["whats_next"]:
+                    lines.append("**What's next:**")
+                    lines.append(cp["whats_next"])
+                    lines.append("")
+                lines.append("---")
+                lines.append("")
+        else:
+            lines.append(
+                "No checkpoints in this window. If the git log above shows "
+                "vault changes (new files, modifications), this represents an "
+                "invariant violation — every change to the vault is supposed "
+                "to be paired with a `checkpoint this` invocation. Flag this "
+                "in the report so the user notices."
+            )
+            lines.append("")
+
     # Project states
     lines.append("## Project States")
     for p in context["project_states"]:
@@ -570,14 +639,17 @@ def context_to_markdown(context: dict) -> str:
         lines.append(f"- Status: {p['readme_frontmatter'].get('status', 'unknown')}")
         lines.append(f"- Last touched: {p['last_touched']} "
                      f"({p['days_since_last_touch']} days ago)")
+
         if p["files_created_in_window"]:
             lines.append(f"- Files created: {', '.join(p['files_created_in_window'])}")
         if p["files_modified_in_window"]:
             lines.append(f"- Files modified: {', '.join(p['files_modified_in_window'])}")
+
         if p["decisions_new"]:
             lines.append(f"- New decisions: {len(p['decisions_new'])}")
             for d in p["decisions_new"]:
                 lines.append(f"  - {d['date']}: {d['title']}")
+
         lines.append("")
 
         # Include changed file contents
@@ -602,7 +674,7 @@ def context_to_markdown(context: dict) -> str:
                 lines.append("```")
                 lines.append(data["content_preview"])
                 lines.append("```")
-            lines.append("")
+        lines.append("")
 
     # Spanish metrics
     lines.append("## Spanish Metrics")
@@ -650,6 +722,7 @@ if __name__ == "__main__":
     import sys
 
     report_type = sys.argv[1] if len(sys.argv) > 1 else "weekly"
+
     if report_type not in ("daily", "weekly", "monthly"):
         print(f"Usage: python context_builder.py [daily|weekly|monthly]")
         sys.exit(1)

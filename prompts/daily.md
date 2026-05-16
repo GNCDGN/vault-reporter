@@ -9,12 +9,13 @@ Below is a structured context block containing:
 - Yesterday's daily note summary
 - Spanish learning metrics
 - Yesterday's daily briefing (for delta computation)
+- **Checkpoints in the window** — short notes Genco's tools (Claude Code and Claude Desktop) write whenever they make a vault change, capturing the *why* behind each change. These are the primary source for the "What happened" narrative below.
 
 ---
 
 ## Your task
 
-Generate a concise written daily briefing. This is a WRITTEN DOCUMENT read every morning. It tells the user what changed and what needs attention today.
+Generate a concise written daily briefing. This is a WRITTEN DOCUMENT read every morning. It tells the user what changed yesterday and what needs attention today.
 
 The report must:
 - Be 400–700 words plus any tables
@@ -23,23 +24,45 @@ The report must:
 - Be honest about gaps
 - Name drift — idle projects flagged, not hidden
 - Be SHORT on quiet days — don't pad
+- **Use the checkpoints as the primary source for "What happened yesterday"** — see structure below
+
+---
+
+## How to use the checkpoints (CRITICAL — read this carefully)
+
+The checkpoint notes in the context block are the *most valuable* signal for this report. Each one tells you what changed and why, written at the moment of the change by Genco's tools. Without them, all you have is a git log — files and commits with no intent. With them, you can write a narrative that captures the actual story of yesterday's work.
+
+**Rules for using checkpoints:**
+
+1. **The "What happened yesterday" section is built from checkpoint stories.** Each checkpoint is one thread of yesterday's story. Group related checkpoints into themes (e.g. "the Veronica deployment thread", "the Spanish thread"). Weave them into a 400-600 word narrative. Don't list checkpoints mechanically — synthesise them into prose.
+
+2. **The "Why" section of each checkpoint is gold.** Use it. Genco wrote it (or his assistant did, with his confirmation) because it captures intent that isn't visible from the file diff. When a checkpoint says "the alternative considered was X" or "this resolves the ambiguity from Tuesday," that context belongs in the narrative.
+
+3. **Cite checkpoint paths inline when useful.** If a thread of work spans multiple checkpoints, reference them so the user can drill down. Format: `[YYYY-MM-DD HH:MM]` or a wikilink to the file path. Don't cite every checkpoint — just when it adds value.
+
+4. **The "What's next" sections from checkpoints inform the "Things requiring your attention" section.** If yesterday's checkpoints flagged a next step, surface it.
+
+5. **If you see git changes in the context but NO checkpoint covering them, FLAG IT.** Every vault change is supposed to be paired with a `checkpoint this` invocation per the protocol. A missing checkpoint is an invariant violation. Add a short note at the end of "What happened yesterday" saying:
+   > "Note: I see modifications to `<file>` in the git log without a matching checkpoint. The checkpoint protocol expects every vault change to be paired with one. Worth checking whether this was an automated change (Veronica's own write-back), or a missed `checkpoint this` step."
+   Don't make this dramatic — one short paragraph at most. But don't hide it.
+
+6. **If there are zero checkpoints AND zero git changes, yesterday was quiet.** Say so. One factual paragraph: "Nothing landed in the vault yesterday. No commits, no checkpoints." That's a valid daily.
+
+7. **If there are zero checkpoints but there ARE git changes, that's the invariant violation case at scale.** Flag it more prominently — first paragraph of the "What happened" section.
 
 ---
 
 ## Report structure
 
 ### Top of the brief
-3–5 sentences. The single most important thing about today. Pick ONE: a status read, a drift warning, a surfaced commitment from yesterday's daily note, or a milestone observation.
+3–5 sentences. The single most important thing about today. Pick ONE: a status read, a drift warning, a surfaced commitment from yesterday's daily note, or a milestone observation. Lean on yesterday's checkpoints to figure out what was most consequential.
 
-### What changed since yesterday
-One-sentence headline characterising yesterday's work, then sub-sections only for categories that apply (omit empty categories entirely):
+### What happened yesterday
+**This is the section the checkpoints feed.** A 400-600 word narrative built from the checkpoint stories, grouped into themes, with the "why" behind each change woven in. Not a list. Not a table. Prose.
 
-**New work** — new files added to any project (project name, filename, what it represents, what it's about)
-**Modifications** — files edited (what changed and why; roll up trivial edits: "plus 3 minor edits across X")
-**Decisions logged** — new decisions.md entries (title + one-sentence reasoning)
-**Status changes** — only if a project status actually changed
-**Vault-level additions** — new templates, Galaxy notes, MOCs
-**NEW PROJECT** — if a new project folder appeared, call it out prominently
+If there were no checkpoints and no changes, this is one short paragraph saying yesterday was quiet.
+
+If there were git changes but no checkpoints (invariant violation), open with that observation.
 
 ### Active projects table
 A markdown table: | Project | Status | Last touched | Activity this week | Health |
@@ -47,7 +70,11 @@ Health column: ✅ on track / ⚠️ idle (expected) / 🟥 drifting
 One paragraph below the table picking out 1–2 projects worth attention this morning.
 
 ### Things requiring your attention
-Bulleted list. Complete sentences with dates and links. Maximum 5 items. Scan for: #decision-needed, #follow-up, #blocked, unchecked priorities from yesterday, decisions without next steps.
+Bulleted list. Complete sentences with dates and links. Maximum 5 items. Sources:
+- Yesterday's checkpoints' "What's next" sections
+- `#decision-needed`, `#follow-up`, `#blocked` tags in daily notes
+- Unchecked priorities from yesterday's daily note
+- Decisions made without next steps
 
 ### Today's carried-forward priorities
 Yesterday's unchecked Top 3 priorities, or "All priorities completed yesterday."
@@ -56,7 +83,7 @@ Yesterday's unchecked Top 3 priorities, or "All priorities completed yesterday."
 Three lines: current week/phase, hours logged this week vs target, gap. Link to full dashboard: [[01-Projects/learn-spanish/today]]
 
 ### Quiet observations
-Optional. Only include if the AI has a genuinely useful pattern to flag. Omit entirely if nothing notable.
+Optional. Only include if the AI has a genuinely useful pattern to flag based on the checkpoint stories or the broader context (e.g. "third day in a row with checkpoints only from claude-desktop, no claude-code activity"). Omit entirely if nothing notable.
 
 ---
 
@@ -82,7 +109,7 @@ For Genco's voice and the anti-patterns to avoid:
 {
   "summary": "One sentence. What happened yesterday. Factual; kept for back-compat.",
   "messages": {
-    "greeting": "The opening Telegram message that arrives with the PDF. 1-3 sentences for daily — keep it tight. Opens with 'Morning —'. Surfaces the single most relevant thing about yesterday plus today's read. If there are no questions to follow (typical for daily), the sentence ends cleanly without a question hook. Example shape: 'Morning — daily's in. Spanish day 1 done, 47 mins on Phase 1 phonetics. Prediction-markets is at 15 days idle now. PDF below.' Vary it day to day.",
+    "greeting": "The opening Telegram message that arrives with the PDF. 1-3 sentences for daily — keep it tight. Opens with 'Morning —'. Surfaces the single most relevant thing from yesterday's checkpoints. If you noticed a missing-checkpoint invariant violation, the greeting may mention it ('Morning — daily's in. One thing flagged: a git change yesterday without a matching checkpoint, worth a glance.'). Vary it day to day.",
     "no_questions_signoff": "Used when questions is empty (the usual case for daily). Single sentence. Often something quiet like 'Nothing to ask on this one.' or omitted entirely if the greeting already closed cleanly. If the greeting already feels complete, this can be an empty string and the bot will skip it.",
     "completion_clean": "If a daily report did ask a question and the answer wrote back fine. Must include literal {written}. Example: 'Got it — that's in the vault.'",
     "completion_partial": "Must include {written}, {total}, {failed} as literal placeholders.",
@@ -108,7 +135,7 @@ For Genco's voice and the anti-patterns to avoid:
 }
 ```
 
-Daily reports typically have ZERO questions — the daily cadence is too frequent for Q&A. Only include a question if something genuinely urgent needs the user's input (e.g. a project went from active to broken and needs a decision today).
+Daily reports typically have ZERO questions — the daily cadence is too frequent for Q&A. Only include a question if something genuinely urgent needs the user's input (e.g. an invariant violation that needs clarification, a project went from active to broken and needs a decision today, a checkpoint's "What's next" flagged something requiring user judgement).
 
 All `messages` fields are REQUIRED even when questions is empty, except `no_questions_signoff` which may be an empty string if the greeting already feels complete.
 

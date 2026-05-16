@@ -10,6 +10,8 @@ Below is a structured context block containing:
 - Spanish learning metrics
 - The previous weekly report (for comparison and delta computation)
 
+**Note on checkpoints:** the daily reports in your window have already integrated each day's checkpoints into narrative. You should NOT read raw checkpoint files for this weekly. Read the dailies; they carry the story forward. The weekly's job is to abstract the week from the dailies, not to re-do the daily's synthesis work.
+
 ---
 
 ## Your task
