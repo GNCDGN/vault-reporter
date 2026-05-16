@@ -91,6 +91,8 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
     summary TEXT NOT NULL DEFAULT '',
     unsummarised_turn_count INTEGER NOT NULL DEFAULT 0,
     exchange_count INTEGER NOT NULL DEFAULT 0,
+    last_compression_at TEXT NOT NULL DEFAULT '',
+    compression_count INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -335,6 +337,17 @@ def _row_to_chat_session(row: sqlite3.Row) -> dict:
         "summary": row["summary"],
         "unsummarised_turn_count": row["unsummarised_turn_count"],
         "exchange_count": row["exchange_count"],
+        # Defensive .keys() guard mirrors the messages_json handling above:
+        # the columns ship via CREATE TABLE IF NOT EXISTS (no migration, no
+        # populated table predates them), but stay tolerant of an old row.
+        "last_compression_at": (
+            row["last_compression_at"]
+            if "last_compression_at" in row.keys() else ""
+        ),
+        "compression_count": (
+            row["compression_count"]
+            if "compression_count" in row.keys() else 0
+        ),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -463,6 +476,64 @@ def update_chat_summary(session_date: str, new_summary: str) -> dict:
             "UPDATE chat_sessions SET summary = ?, unsummarised_turn_count = 0, "
             "updated_at = ? WHERE session_date = ?",
             (new_summary, now, session_date),
+        )
+        updated = conn.execute(
+            "SELECT * FROM chat_sessions WHERE session_date = ?", (session_date,)
+        ).fetchone()
+    return _row_to_chat_session(updated)
+
+def get_unsummarised_turns(session_date: str) -> list:
+    """Return the last `unsummarised_turn_count` turns from the day's
+    messages, in chronological order — the turns a compression pass would
+    fold into the running summary. Returns a list of {role, content, ts}
+    dicts (empty if there's nothing unsummarised)."""
+    get_chat_session(session_date)  # ensure the row exists
+    with db() as conn:
+        row = conn.execute(
+            "SELECT * FROM chat_sessions WHERE session_date = ?", (session_date,)
+        ).fetchone()
+    try:
+        messages = json.loads(row["messages_json"])
+    except Exception:
+        messages = []
+    n = row["unsummarised_turn_count"]
+    if n <= 0:
+        return []
+    return messages[-n:]
+
+def apply_compression(
+    session_date: str,
+    new_summary: str,
+    summarised_turn_count: int,
+    ts: str,
+) -> dict:
+    """Write a fresh rolling summary after a compression pass.
+
+    unsummarised_turn_count is decremented by summarised_turn_count rather
+    than zeroed: turns that arrived while compression was running weren't in
+    the summarised set, so they must stay in the unsummarised buffer for the
+    next pass. Clamped at 0 defensively — turns are only ever appended
+    between the read and this write, so current >= summarised in normal
+    operation, but a /clear landing mid-compression could reset the count;
+    the clamp keeps the buffer non-negative in that race.
+
+    Also stamps last_compression_at, bumps compression_count, in one
+    transaction. Returns the updated chat session dict."""
+    get_chat_session(session_date)  # ensure the row exists
+    now = _uk_now()
+    with db() as conn:
+        row = conn.execute(
+            "SELECT * FROM chat_sessions WHERE session_date = ?", (session_date,)
+        ).fetchone()
+        remaining = row["unsummarised_turn_count"] - summarised_turn_count
+        if remaining < 0:
+            remaining = 0
+        new_count = row["compression_count"] + 1
+        conn.execute(
+            "UPDATE chat_sessions SET summary = ?, unsummarised_turn_count = ?, "
+            "last_compression_at = ?, compression_count = ?, updated_at = ? "
+            "WHERE session_date = ?",
+            (new_summary, remaining, ts, new_count, now, session_date),
         )
         updated = conn.execute(
             "SELECT * FROM chat_sessions WHERE session_date = ?", (session_date,)

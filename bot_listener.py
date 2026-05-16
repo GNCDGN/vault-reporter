@@ -77,7 +77,7 @@ from sessions import (
 )
 from vault_writeback import write_session_to_vault
 from telegram_sender import render_question
-from chat_handler import handle_chat_message
+from chat_handler import handle_chat_message, run_compression_check
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -309,6 +309,15 @@ async def _handle_conversational(update: Update, text: str):
         log.error(f"[conversational] unexpected exception from chat_handler: {e}", exc_info=True)
         reply = "Something went wrong on my end — try once more?"
     await update.message.reply_text(reply)
+
+    # v4 Phase 2 Step 5: rolling background compression. Fire-and-forget after
+    # the reply is sent so the user never waits for it; the result lands in
+    # the row for the next turn's benefit. run_compression_check is sync and
+    # never raises, so to_thread keeps the event loop free and create_task
+    # makes it truly detached. uk_today() is resolved now, at scheduling time.
+    asyncio.create_task(
+        asyncio.to_thread(run_compression_check, uk_today())
+    )
 
 # ---------------------------------------------------------------------------
 # Session flow helpers

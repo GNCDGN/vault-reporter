@@ -44,6 +44,7 @@ PROMPTS_DIR = SCRIPT_DIR / "prompts"
 VOICE_SPEC_PATH = PROMPTS_DIR / "_voice.md"
 FILE_SELECTION_PROMPT_PATH = PROMPTS_DIR / "_file_selection.md"
 CONVERSATIONAL_PROMPT_PATH = PROMPTS_DIR / "_conversational.md"
+COMPRESSION_PROMPT_PATH = PROMPTS_DIR / "_history_compression.md"
 
 VAULT_PATH = Path(os.path.expanduser(
     os.environ.get("VAULT_PATH", "~/vaults/second-brain")
@@ -67,6 +68,16 @@ MAX_SELECTED_FILES = 10           # cap on stage-1 output
 CHAT_CLAUDE_TIMEOUT = 60          # per-stage timeout, seconds
 MAX_FILE_CONTENT_CHARS = 50_000   # safety cap per file in stage 2
 GIT_PULL_TIMEOUT = 15             # seconds
+
+# Rolling-compression levers (v4 Phase 2 Step 5). Fixed by design — do not
+# tune here. Lever 4: don't compress a conversation shorter than this many
+# exchanges. Lever 2: don't compress fewer than this many unsummarised turns.
+# Lever 1: an exchange whose combined user+assistant content is under this
+# many chars is "short"; an all-short batch is dropped, not summarised.
+COMPRESSION_MIN_EXCHANGES = 8
+COMPRESSION_MIN_UNSUMMARISED = 5
+COMPRESSION_SHORT_EXCHANGE_CHARS = 100
+COMPRESSION_TIMEOUT = 30          # seconds, per the compression claude call
 
 # ---------------------------------------------------------------------------
 # Vault index — Stage 1 input
@@ -593,6 +604,140 @@ def handle_chat_message(user_text: str) -> str:
                     f"reply returned anyway: {e}")
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Rolling background compression (v4 Phase 2 Step 5)
+# ---------------------------------------------------------------------------
+
+def _pair_turns(turns: list) -> list:
+    """Group a flat chronological turn list into (ts, user, assistant)
+    exchange tuples. Turns are appended user-then-assistant per exchange, but
+    the unsummarised slice can begin mid-exchange, so a leading orphan
+    assistant turn and a trailing unanswered user turn are both tolerated."""
+    exchanges: list = []
+    i = 0
+    while i < len(turns):
+        t = turns[i] or {}
+        if t.get("role") == "user":
+            u = t.get("content", "")
+            uts = t.get("ts", "")
+            if i + 1 < len(turns) and (turns[i + 1] or {}).get("role") == "assistant":
+                exchanges.append((uts, u, turns[i + 1].get("content", "")))
+                i += 2
+            else:
+                exchanges.append((uts, u, ""))
+                i += 1
+        else:
+            # Orphan assistant turn (slice started mid-exchange)
+            exchanges.append((t.get("ts", ""), "", t.get("content", "")))
+            i += 1
+    return exchanges
+
+
+def _render_new_exchanges(exchanges: list) -> str:
+    """Render paired exchanges into the <new_exchanges> block the compression
+    prompt expects."""
+    parts: list[str] = ["<new_exchanges>"]
+    for ets, u, a in exchanges:
+        open_tag = f'<exchange ts="{ets}">' if ets else "<exchange>"
+        parts.append(f"{open_tag}user: {u}\nassistant: {a}</exchange>")
+    parts.append("</new_exchanges>")
+    return "\n".join(parts)
+
+
+def run_compression_check(date: str) -> None:
+    """Background-task entry point. Decides whether to compress today's chat
+    history, runs the compression call if so, writes the result. Never
+    raises — invoked fire-and-forget via asyncio.to_thread from the bot
+    listener after the reply has already been sent."""
+    try:
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        import sessions
+    except Exception as e:
+        log.warning(f"[chat:compression] could not import sessions; skipping: {e}")
+        return
+
+    try:
+        session = sessions.get_chat_session(date)
+    except Exception as e:
+        log.warning(f"[chat:compression] could not read session; skipping: {e}")
+        return
+
+    # Lever 4 — conversation too short to be worth compressing yet.
+    if session["exchange_count"] < COMPRESSION_MIN_EXCHANGES:
+        return
+
+    # Lever 2 — too little new material since the last compression.
+    if session["unsummarised_turn_count"] < COMPRESSION_MIN_UNSUMMARISED:
+        return
+
+    try:
+        turns = sessions.get_unsummarised_turns(date)
+    except Exception as e:
+        log.warning(f"[chat:compression] could not load unsummarised turns; "
+                    f"skipping: {e}")
+        return
+    if not turns:
+        return
+
+    exchanges = _pair_turns(turns)
+
+    # Lever 1 — every new exchange is short (small talk, acks). No information
+    # was missed, so advance the buffer without spending a model call.
+    # update_chat_summary resets unsummarised to 0; pass the unchanged summary
+    # so the running record is preserved verbatim.
+    if exchanges and all(
+        len(u) + len(a) < COMPRESSION_SHORT_EXCHANGE_CHARS
+        for _ts, u, a in exchanges
+    ):
+        try:
+            sessions.update_chat_summary(date, session["summary"])
+        except Exception as e:
+            log.warning(f"[chat:compression] short-turn buffer reset failed: {e}")
+            return
+        log.info("[chat:compression] skipped — short turns only")
+        return
+
+    if not COMPRESSION_PROMPT_PATH.exists():
+        log.warning(f"[chat:compression] prompt missing: {COMPRESSION_PROMPT_PATH}")
+        return
+
+    template = COMPRESSION_PROMPT_PATH.read_text()
+    existing_summary = (session.get("summary") or "").strip()
+    prompt = (
+        template
+        + "\n\n---\n\n"
+        + f"<existing_summary>{existing_summary}</existing_summary>\n\n"
+        + _render_new_exchanges(exchanges)
+        + "\n\n---\n\nReturn the updated running summary now. "
+        + "Prose only, 150-200 words, nothing else.\n"
+    )
+
+    ok, output = _call_claude_chat(
+        prompt, stage_label="compression", timeout=COMPRESSION_TIMEOUT
+    )
+    if not ok:
+        log.warning(f"[chat:compression] failed: {output}")
+        return
+
+    new_summary = output.strip()
+    if not new_summary:
+        log.warning("[chat:compression] failed: empty-reply")
+        return
+
+    ts = datetime.now(ZoneInfo("Europe/London")).isoformat(timespec="seconds")
+    try:
+        updated = sessions.apply_compression(date, new_summary, len(turns), ts)
+    except Exception as e:
+        log.warning(f"[chat:compression] could not write compressed summary: {e}")
+        return
+
+    log.info(
+        f"[chat:compression] applied — {len(turns)} turns summarised, "
+        f"count now {updated['compression_count']}"
+    )
 
 
 # ---------------------------------------------------------------------------
