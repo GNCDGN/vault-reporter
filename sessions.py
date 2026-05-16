@@ -17,6 +17,12 @@ stored at session-creation time so the bot doesn't need to regenerate them.
 
 Schema migrates gracefully: if `messages_json` doesn't exist on an older DB,
 the column is added via ALTER TABLE on first import.
+
+v4 Phase 2 addition: a separate `chat_sessions` table holds Veronica's
+within-day conversational memory — one row per UK calendar day, the day's
+turns stored as a JSON list, plus a rolling summary and turn/exchange
+counters. Created via CREATE TABLE IF NOT EXISTS like `sessions`. "Today"
+is always computed at read-time in Europe/London, never stored at creation.
 """
 
 import os
@@ -26,8 +32,12 @@ import logging
 from contextlib import contextmanager
 from datetime import datetime, date
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 log = logging.getLogger(__name__)
+
+# UK time governs the chat-session day boundary (00:00–00:00 Europe/London).
+UK_TZ = ZoneInfo("Europe/London")
 
 # ---------------------------------------------------------------------------
 # Database location
@@ -73,6 +83,17 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_status ON sessions(status);
+
+CREATE TABLE IF NOT EXISTS chat_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_date TEXT NOT NULL UNIQUE,
+    messages_json TEXT NOT NULL DEFAULT '[]',
+    summary TEXT NOT NULL DEFAULT '',
+    unsummarised_turn_count INTEGER NOT NULL DEFAULT 0,
+    exchange_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 def init_db():
@@ -283,6 +304,123 @@ def get_session(session_id: int) -> dict | None:
     return _row_to_session(row)
 
 # ---------------------------------------------------------------------------
+# Chat sessions (v4 Phase 2 — within-day conversational memory)
+# ---------------------------------------------------------------------------
+
+def _uk_today() -> str:
+    """Today's date in UK time as a YYYY-MM-DD string."""
+    return datetime.now(UK_TZ).strftime("%Y-%m-%d")
+
+def _uk_now() -> str:
+    """Current UK timestamp, seconds precision — matches the session style."""
+    return datetime.now(UK_TZ).isoformat(timespec="seconds")
+
+def _row_to_chat_session(row: sqlite3.Row) -> dict:
+    """Convert a chat_sessions row into a dict, parsing the messages blob."""
+    if row is None:
+        return None
+    try:
+        messages = json.loads(row["messages_json"])
+    except Exception:
+        messages = []
+    return {
+        "id": row["id"],
+        "session_date": row["session_date"],
+        "messages": messages,
+        "summary": row["summary"],
+        "unsummarised_turn_count": row["unsummarised_turn_count"],
+        "exchange_count": row["exchange_count"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+def get_chat_session(session_date: str | None = None) -> dict:
+    """Return the chat session for the given UK date (defaults to today).
+    Creates the row with empty defaults if it doesn't exist yet."""
+    session_date = session_date or _uk_today()
+    now = _uk_now()
+    with db() as conn:
+        row = conn.execute(
+            "SELECT * FROM chat_sessions WHERE session_date = ?", (session_date,)
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                "INSERT INTO chat_sessions "
+                "(session_date, messages_json, summary, unsummarised_turn_count, "
+                "exchange_count, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (session_date, "[]", "", 0, 0, now, now),
+            )
+            row = conn.execute(
+                "SELECT * FROM chat_sessions WHERE session_date = ?", (session_date,)
+            ).fetchone()
+    return _row_to_chat_session(row)
+
+def append_chat_turn(
+    session_date: str, role: str, content: str, ts: str
+) -> dict:
+    """Append a {role, content, ts} turn to the day's chat session.
+
+    Increments unsummarised_turn_count on every turn. Increments
+    exchange_count by 1 on assistant turns only — one exchange is one user
+    message plus one assistant reply, so it's counted on the reply.
+    Returns the updated chat session dict."""
+    get_chat_session(session_date)  # ensure the row exists
+    now = _uk_now()
+    with db() as conn:
+        row = conn.execute(
+            "SELECT * FROM chat_sessions WHERE session_date = ?", (session_date,)
+        ).fetchone()
+        messages = json.loads(row["messages_json"])
+        messages.append({"role": role, "content": content, "ts": ts})
+        unsummarised = row["unsummarised_turn_count"] + 1
+        exchanges = row["exchange_count"] + (1 if role == "assistant" else 0)
+        conn.execute(
+            "UPDATE chat_sessions SET messages_json = ?, "
+            "unsummarised_turn_count = ?, exchange_count = ?, updated_at = ? "
+            "WHERE session_date = ?",
+            (json.dumps(messages), unsummarised, exchanges, now, session_date),
+        )
+        updated = conn.execute(
+            "SELECT * FROM chat_sessions WHERE session_date = ?", (session_date,)
+        ).fetchone()
+    return _row_to_chat_session(updated)
+
+def clear_chat_session(session_date: str) -> dict:
+    """Wipe the day's conversation in place — messages, summary, and both
+    counters reset. The row itself is kept (not deleted) for inspection.
+    Returns the updated chat session dict."""
+    get_chat_session(session_date)  # ensure the row exists
+    now = _uk_now()
+    with db() as conn:
+        conn.execute(
+            "UPDATE chat_sessions SET messages_json = '[]', summary = '', "
+            "unsummarised_turn_count = 0, exchange_count = 0, updated_at = ? "
+            "WHERE session_date = ?",
+            (now, session_date),
+        )
+        updated = conn.execute(
+            "SELECT * FROM chat_sessions WHERE session_date = ?", (session_date,)
+        ).fetchone()
+    return _row_to_chat_session(updated)
+
+def update_chat_summary(session_date: str, new_summary: str) -> dict:
+    """Overwrite the rolling summary and reset unsummarised_turn_count to 0.
+    Returns the updated chat session dict."""
+    get_chat_session(session_date)  # ensure the row exists
+    now = _uk_now()
+    with db() as conn:
+        conn.execute(
+            "UPDATE chat_sessions SET summary = ?, unsummarised_turn_count = 0, "
+            "updated_at = ? WHERE session_date = ?",
+            (new_summary, now, session_date),
+        )
+        updated = conn.execute(
+            "SELECT * FROM chat_sessions WHERE session_date = ?", (session_date,)
+        ).fetchone()
+    return _row_to_chat_session(updated)
+
+# ---------------------------------------------------------------------------
 # CLI inspection
 # ---------------------------------------------------------------------------
 
@@ -323,8 +461,29 @@ def _cli():
         close_session(int(args[1]), final_status="cancelled")
         print(f"Closed session {args[1]}.")
 
+    elif cmd == "chat_today":
+        s = get_chat_session()
+        print(f"Chat session — {s['session_date']}")
+        print(f"Exchanges: {s['exchange_count']}")
+        print(f"Unsummarised turns: {s['unsummarised_turn_count']}")
+        print(f"Summary: {s['summary'] or '(no summary yet)'}")
+        print()
+        if not s["messages"]:
+            print("(no turns yet)")
+        else:
+            for m in s["messages"]:
+                ts = m.get("ts", "")
+                role = m.get("role", "?")
+                content = m.get("content", "")
+                print(f"[{ts}] {role}: {content}")
+
+    elif cmd == "chat_clear":
+        clear_chat_session(_uk_today())
+        print("cleared.")
+
     else:
-        print("Usage: sessions.py [init|list|active|close <id>]")
+        print("Usage: sessions.py [init|list|active|close <id>|"
+              "chat_today|chat_clear]")
 
 if __name__ == "__main__":
     _cli()
