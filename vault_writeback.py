@@ -138,13 +138,22 @@ def write_prepend_h2(file_path: Path, h2_title: str, new_content: str) -> bool:
 
 
 def write_append_to_section(file_path: Path, heading: str, new_content: str) -> bool:
-    """Append content to the end of a named section."""
+    """
+    Append content to the end of a named section.
+    If heading is empty/None, append to the end of the file instead.
+    """
     if not file_path.exists():
         log.error(f"[writeback] file not found: {file_path}")
         return False
 
     content = file_path.read_text(encoding="utf-8")
     fm, body = _split_frontmatter(content)
+
+    if not heading:
+        log.info(f"[writeback] no section specified for {file_path.name}, appending to end of file")
+        body = body.rstrip() + "\n\n" + new_content.strip() + "\n"
+        file_path.write_text(fm + body if fm else body, encoding="utf-8")
+        return True
 
     section_range = _find_section_range(body, heading)
     if section_range is None:
@@ -204,9 +213,7 @@ def apply_answer(answer: dict) -> bool:
 
         elif mode == "append_to_section":
             section = instr.get("section") or ""
-            if not section:
-                log.warning("[writeback] append_to_section missing 'section'")
-                return False
+            # Empty section is now allowed - falls back to appending at EOF
             return write_append_to_section(file_path, section, text)
 
         else:
