@@ -409,13 +409,34 @@ def _render_history_section(session: dict) -> str:
     if not summary and not messages:
         return ""
 
+    # Bound the raw turns by unsummarised_turn_count once a summary exists,
+    # so compression actually shrinks the prompt instead of stacking the
+    # summary on top of the full log. No summary → nothing compressed today,
+    # render the whole log (Phase 1 behaviour). Summary present → the summary
+    # covers everything up to the last compression; only the unsummarised
+    # tail is still raw. The count is a message count (one per role), not an
+    # exchange count, so slice by count: unsummarised == 0 → no raw turns.
+    if not summary:
+        to_render = messages
+    else:
+        n = session.get("unsummarised_turn_count", 0) or 0
+        if n > len(messages):
+            log.warning(
+                f"[chat:stage2] unsummarised_turn_count ({n}) exceeds "
+                f"message count ({len(messages)}); clamping to "
+                f"{len(messages)} — likely a chat_session state-corruption "
+                f"bug upstream"
+            )
+            n = len(messages)
+        to_render = messages[-n:] if n > 0 else []
+
     parts: list[str] = ["## Conversation history (today)", ""]
     if summary:
         parts.append("<conversation_summary>")
         parts.append(summary)
         parts.append("</conversation_summary>")
         parts.append("")
-    for m in messages:
+    for m in to_render:
         role = m.get("role")
         content = m.get("content", "")
         ts = m.get("ts")
