@@ -27,6 +27,10 @@ Return 150–200 words of plain prose. One single paragraph. No bullets, no head
 - Specific facts: project names, numbers, dates, named entities, file or feature names
 - Commitments, intentions, and anything left open or deferred
 
+## Preserve, do not interpret
+
+Reproduce facts as they appeared in the exchanges. Do not add framing words like "confirmed", "established", "agreed", "decided", or "verified" unless the source turn explicitly used them. If the source said "the repo is public", write "the repo is public" — not "the repo is confirmed public". The compression captures what was said; it does not certify or upgrade those statements.
+
 ## What to drop
 
 - Small talk, greetings, acknowledgements ("thanks", "ok", "got it")
