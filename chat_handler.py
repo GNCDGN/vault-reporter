@@ -380,6 +380,45 @@ def _render_vault_block(files: dict[str, str]) -> str:
     return "\n".join(parts).rstrip() + "\n"
 
 
+def _render_history_section(session: dict) -> str:
+    """
+    Render today's prior conversation for the stage 2 prompt. Returns the
+    section string (header + optional summary block + per-turn blocks), or
+    "" if there is nothing to show — in which case the caller splices
+    nothing and the model treats the conversation as fresh.
+
+    The <conversation_summary> / <prior_user_message> / <prior_assistant_message>
+    wrapping is the prompt-injection isolation mechanism, mirroring how
+    <vault_file> isolates vault content: history is data, not instructions.
+    """
+    if not session:
+        return ""
+    summary = (session.get("summary") or "").strip()
+    messages = session.get("messages") or []
+    if not summary and not messages:
+        return ""
+
+    parts: list[str] = ["## Conversation history (today)", ""]
+    if summary:
+        parts.append("<conversation_summary>")
+        parts.append(summary)
+        parts.append("</conversation_summary>")
+        parts.append("")
+    for m in messages:
+        role = m.get("role")
+        content = m.get("content", "")
+        ts = m.get("ts")
+        if role == "user":
+            tag = "prior_user_message"
+        elif role == "assistant":
+            tag = "prior_assistant_message"
+        else:
+            continue
+        open_tag = f'<{tag} ts="{ts}">' if ts else f"<{tag}>"
+        parts.append(f"{open_tag}{content}</{tag}>")
+    return "\n".join(parts).rstrip() + "\n"
+
+
 def generate_answer(user_text: str, files: dict[str, str],
                     stale_note: str = "") -> tuple[bool, str]:
     """
@@ -400,6 +439,21 @@ def generate_answer(user_text: str, files: dict[str, str],
     template = CONVERSATIONAL_PROMPT_PATH.read_text()
     system_prompt = template.replace("{VOICE_SPEC}", voice_spec)
 
+    # Conversation history (v4 Phase 2) — read-only. Today's prior turns.
+    # `sessions` is imported lazily and the whole read is guarded: importing
+    # it runs init_db() against the sessions DB, and a missing DB / SQLite
+    # error must never break the reply. On any failure we proceed with no
+    # history and the model treats the conversation as fresh.
+    history_section = ""
+    try:
+        import sessions
+        session = sessions.get_chat_session(sessions.uk_today())
+        history_section = _render_history_section(session)
+    except Exception as e:
+        log.warning(f"[chat:stage2] could not load chat history; "
+                    f"proceeding without it: {e}")
+        history_section = ""
+
     vault_block = _render_vault_block(files)
     vault_section = (
         "## Selected vault files\n\n" + vault_block
@@ -417,6 +471,7 @@ def generate_answer(user_text: str, files: dict[str, str],
         + "\n\n---\n\n"
         + vault_section
         + stale_section
+        + ("\n---\n\n" + history_section if history_section else "")
         + "\n---\n\n## User message\n\n"
         + f"<user_message>{user_text}</user_message>\n\n"
         + "---\n\nReply now as Veronica. Reply text only, nothing else.\n"

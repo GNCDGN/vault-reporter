@@ -311,6 +311,11 @@ def _uk_today() -> str:
     """Today's date in UK time as a YYYY-MM-DD string."""
     return datetime.now(UK_TZ).strftime("%Y-%m-%d")
 
+def uk_today() -> str:
+    """Public accessor for the UK chat-session date string. Callers outside
+    this module (e.g. chat_handler) use this to resolve 'today'."""
+    return _uk_today()
+
 def _uk_now() -> str:
     """Current UK timestamp, seconds precision — matches the session style."""
     return datetime.now(UK_TZ).isoformat(timespec="seconds")
