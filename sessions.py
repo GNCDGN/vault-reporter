@@ -391,6 +391,50 @@ def append_chat_turn(
         ).fetchone()
     return _row_to_chat_session(updated)
 
+def _append_one(conn, session_date: str, role: str, content: str, ts: str):
+    """Append a single {role, content, ts} turn to the day's row using the
+    given open connection. No commit, no close — the caller owns the
+    transaction. Mirrors append_chat_turn's counter rules: unsummarised +1
+    every turn, exchange +1 on assistant turns only. Used to keep both turns
+    of an exchange in one transaction (see append_chat_exchange)."""
+    now = _uk_now()
+    row = conn.execute(
+        "SELECT * FROM chat_sessions WHERE session_date = ?", (session_date,)
+    ).fetchone()
+    messages = json.loads(row["messages_json"])
+    messages.append({"role": role, "content": content, "ts": ts})
+    unsummarised = row["unsummarised_turn_count"] + 1
+    exchanges = row["exchange_count"] + (1 if role == "assistant" else 0)
+    conn.execute(
+        "UPDATE chat_sessions SET messages_json = ?, "
+        "unsummarised_turn_count = ?, exchange_count = ?, updated_at = ? "
+        "WHERE session_date = ?",
+        (json.dumps(messages), unsummarised, exchanges, now, session_date),
+    )
+
+def append_chat_exchange(
+    session_date: str, user_content: str, assistant_content: str, ts: str
+) -> dict:
+    """Append both turns of one exchange (user message + assistant reply) in
+    a single transaction. Either both turns land or neither does.
+
+    Both turns get the same `ts`. exchange_count increments by 1 total
+    (counted on the assistant turn); unsummarised_turn_count increments by 2.
+    Returns the updated chat session dict, same shape as the other helpers.
+
+    Atomicity: a single db() connection wraps both writes. db() commits only
+    on clean exit of the with-block; any exception skips the commit and the
+    connection closes with the implicit transaction unrolled — so a failure
+    between the two turns leaves the row untouched (no orphaned user turn)."""
+    get_chat_session(session_date)  # ensure the row exists (own txn, committed)
+    with db() as conn:
+        _append_one(conn, session_date, "user", user_content, ts)
+        _append_one(conn, session_date, "assistant", assistant_content, ts)
+        updated = conn.execute(
+            "SELECT * FROM chat_sessions WHERE session_date = ?", (session_date,)
+        ).fetchone()
+    return _row_to_chat_session(updated)
+
 def clear_chat_session(session_date: str) -> dict:
     """Wipe the day's conversation in place — messages, summary, and both
     counters reset. The row itself is kept (not deleted) for inspection.

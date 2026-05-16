@@ -576,6 +576,22 @@ def handle_chat_message(user_text: str) -> str:
     if not ok:
         return _error_to_reply("stage2", result)
 
+    # Step 6 — persist the exchange (v4 Phase 2, success path only).
+    # Both turns written atomically after a successful reply. Same lazy-import
+    # discipline as generate_answer's history read: importing `sessions` runs
+    # init_db(), so it's imported inside this guarded block. Any persistence
+    # failure is swallowed — the reply goes back to Telegram regardless. Failed
+    # turns (early returns above) intentionally leave no trace in history.
+    try:
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        import sessions
+        ts = datetime.now(ZoneInfo("Europe/London")).strftime("%H:%M")
+        sessions.append_chat_exchange(sessions.uk_today(), text, result, ts)
+    except Exception as e:
+        log.warning(f"[chat:persist] could not persist exchange; "
+                    f"reply returned anyway: {e}")
+
     return result
 
 
