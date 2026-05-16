@@ -226,6 +226,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Commands:\n"
         "/status — what's live right now\n"
         "/cancel — drop the current session\n"
+        "/clear — wipe today's chat memory\n"
         "/help — this message\n\n"
         "In a session: send your answer, or `skip` / `done`."
     )

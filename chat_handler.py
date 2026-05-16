@@ -665,6 +665,12 @@ def run_compression_check(date: str) -> None:
         log.warning(f"[chat:compression] could not read session; skipping: {e}")
         return
 
+    # Capture the clear epoch as of this read. If a /clear lands while the
+    # compression model call is running, the epoch will have moved by the
+    # time we re-check just before the write, and we abort rather than write
+    # a stale summary onto a freshly-cleared row. The user's clear wins.
+    start_epoch = session["clear_epoch"]
+
     # Lever 4 — conversation too short to be worth compressing yet.
     if session["exchange_count"] < COMPRESSION_MIN_EXCHANGES:
         return
@@ -725,6 +731,22 @@ def run_compression_check(date: str) -> None:
     new_summary = output.strip()
     if not new_summary:
         log.warning("[chat:compression] failed: empty-reply")
+        return
+
+    # Epoch re-check — the last thing before the write. Compression already
+    # paid its cost (the model call ran), but if a /clear intervened we drop
+    # the result rather than resurrect a stale summary onto a cleared row.
+    try:
+        current_epoch = sessions.get_clear_epoch(date)
+    except Exception as e:
+        log.warning(f"[chat:compression] could not re-check clear epoch; "
+                    f"skipping write: {e}")
+        return
+    if current_epoch != start_epoch:
+        log.info(
+            f"[chat:compression] aborted — clear intervened "
+            f"(epoch {start_epoch} → {current_epoch})"
+        )
         return
 
     ts = datetime.now(ZoneInfo("Europe/London")).isoformat(timespec="seconds")

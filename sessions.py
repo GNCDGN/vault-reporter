@@ -93,6 +93,7 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
     exchange_count INTEGER NOT NULL DEFAULT 0,
     last_compression_at TEXT NOT NULL DEFAULT '',
     compression_count INTEGER NOT NULL DEFAULT 0,
+    clear_epoch INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -348,6 +349,10 @@ def _row_to_chat_session(row: sqlite3.Row) -> dict:
             row["compression_count"]
             if "compression_count" in row.keys() else 0
         ),
+        "clear_epoch": (
+            row["clear_epoch"]
+            if "clear_epoch" in row.keys() else 0
+        ),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -451,13 +456,18 @@ def append_chat_exchange(
 def clear_chat_session(session_date: str) -> dict:
     """Wipe the day's conversation in place — messages, summary, and both
     counters reset. The row itself is kept (not deleted) for inspection.
-    Returns the updated chat session dict."""
+
+    clear_epoch is incremented (never reset) in the same transaction: it
+    monotonically counts clears so an in-flight compression can detect that
+    a /clear landed mid-pass and abort its stale write (see
+    chat_handler.run_compression_check). Returns the updated session dict."""
     get_chat_session(session_date)  # ensure the row exists
     now = _uk_now()
     with db() as conn:
         conn.execute(
             "UPDATE chat_sessions SET messages_json = '[]', summary = '', "
-            "unsummarised_turn_count = 0, exchange_count = 0, updated_at = ? "
+            "unsummarised_turn_count = 0, exchange_count = 0, "
+            "clear_epoch = clear_epoch + 1, updated_at = ? "
             "WHERE session_date = ?",
             (now, session_date),
         )
@@ -500,6 +510,17 @@ def get_unsummarised_turns(session_date: str) -> list:
     if n <= 0:
         return []
     return messages[-n:]
+
+def get_clear_epoch(session_date: str) -> int:
+    """Return the day's clear_epoch — a fast single-column read used by the
+    compression task to detect a /clear that landed mid-pass. Returns 0 if
+    the row doesn't exist yet (equivalent to never-cleared)."""
+    with db() as conn:
+        row = conn.execute(
+            "SELECT clear_epoch FROM chat_sessions WHERE session_date = ?",
+            (session_date,),
+        ).fetchone()
+    return row["clear_epoch"] if row is not None else 0
 
 def apply_compression(
     session_date: str,
