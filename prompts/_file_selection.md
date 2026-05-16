@@ -31,10 +31,22 @@ If the question is vault-grounded but you genuinely can't tell which files are r
 - Prefer files whose frontmatter `project:` field matches the topic of the question
 - Prefer files whose path or name closely matches words in the question
 - For "status of X" questions, prefer the project's README.md and any setup-log.md, decisions.md, or architecture.md
+- **For projects with version-numbered files** (`v1.md`, `v2.md`, `v3.md`, …), always prefer the highest-numbered version — that's the current state. Earlier versions are historical and rarely the right answer to "what's the status of X". If the question explicitly asks about an older version ("what was v2 about"), include that specific version instead.
 - For "did I decide about X" questions, prefer decisions.md files
 - For "what's the latest on X" questions, prefer recently-modified files (use the `date:` and `last_updated:` frontmatter fields)
 - For questions about Veronica herself, prefer files under `01-Projects/second-brain/veronica/`
 - Do not select files from `04-Archive/`, `_attachments/`, `.trash/`, `00-Inbox/_dumps/` — these are excluded from the index already, but if any leak through, skip them
+
+## Match on question *shape*, not just keyword proximity
+
+A file mentioning a keyword in passing is rarely as relevant as a file whose *purpose* is to record information on that topic. The frontmatter `project:` field, file name, and folder path tell you a file's purpose. Use them.
+
+Concretely:
+- "did I decide about X" → the `decisions.md` of the project that owns X, not every file that mentions X
+- "what's the architecture of Y" → `architecture.md` under Y's folder, not every file with the word "architecture"
+- "what's the latest on Z" → files inside Z's project folder, not unrelated files that happen to reference Z
+
+When in doubt: the file path's *folder structure* tells you who owns the topic. A file at `01-Projects/foo/decisions.md` exists to record foo's decisions. A file at `12-Redriff/business-overview.md` exists to describe Redriff's business — it might mention foo in passing, but it isn't where foo's decisions live.
 
 ## Hard limit
 
