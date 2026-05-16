@@ -20,12 +20,21 @@ A "conversational mode" placeholder route is added: when a message arrives
 with no active session, the bot replies with a friendly note that a real
 conversational assistant isn't built yet. This claims the architectural
 slot for the future ad-hoc vault-assistant work.
+
+v4 Phase 1: the conversational route is no longer a placeholder. Messages
+with no active session are handed off to chat_handler.handle_chat_message,
+which runs a two-stage vault retrieval (file selection → answer generation)
+via `claude --print` and returns the reply. See chat_handler.py for the
+flow and prompts/_conversational.md and prompts/_file_selection.md for the
+prompts. The legacy placeholder strings are retained for ~two weeks as a
+quick-revert option (see LEGACY_PLACEHOLDERS below).
 """
 
 import os
 import sys
 import json
 import random
+import asyncio
 import logging
 from pathlib import Path
 
@@ -66,6 +75,7 @@ from sessions import (
 )
 from vault_writeback import write_session_to_vault
 from telegram_sender import render_question
+from chat_handler import handle_chat_message
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -240,15 +250,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _ask_next_or_finish(update, updated)
 
 # ---------------------------------------------------------------------------
-# Conversational placeholder route
+# Conversational route (v4 Phase 1)
 # ---------------------------------------------------------------------------
 
-# A small bank of replies for "user texted with no session active". These are
-# the only hardcoded chat replies left in the codebase — they're a placeholder
-# until the real conversational assistant ships. Plain, mildly varied to avoid
-# the exact same line every time, and uses the same anti-pattern rules as
-# voice (no service-y phrasing, no exclamation marks).
-PLACEHOLDER_REPLIES = [
+# v2 placeholder strings, retained per the v4 design's rollback note:
+# kept around for ~two weeks post-deployment as a quick-revert option if
+# Phase 1 misbehaves. To roll back, swap the body of _handle_conversational
+# back to `random.choice(LEGACY_PLACEHOLDERS)` and remove the chat_handler
+# import.
+LEGACY_PLACEHOLDERS = [
     "Not built for free-form chat yet — that's coming. For now I only speak when a report has questions. /status to see what's live.",
     "Conversational mode isn't live yet. I only handle replies to scheduled reports. /status if you're not sure what's running.",
     "No question on the table right now, and I can't do open conversation yet. Soon. /status to check.",
@@ -258,12 +268,22 @@ async def _handle_conversational(update: Update, text: str):
     """
     Route for messages that arrive with no active session.
 
-    Today this just sends a placeholder. The slot exists so when the real
-    vault-assistant work happens later, this is the function that gets
-    rewritten — bot architecture stays the same.
+    v4 Phase 1: hands off to chat_handler.handle_chat_message, which runs the
+    two-stage retrieval and returns a reply string. The handler is synchronous
+    (it shells out to `claude --print` twice per turn), so we run it in a
+    thread to avoid blocking the bot's event loop while the model thinks.
+
+    The handler never raises — all failure modes come back as polite reply
+    strings. So this wrapper stays thin.
     """
-    reply = random.choice(PLACEHOLDER_REPLIES)
-    log.info(f"[conversational] placeholder reply to: {text[:60]}")
+    log.info(f"[conversational] handling: {text[:80]}")
+    try:
+        reply = await asyncio.to_thread(handle_chat_message, text)
+    except Exception as e:
+        # Defensive — handle_chat_message contracts as never-raising, but if
+        # it does, don't take the whole bot down or leave the user hanging.
+        log.error(f"[conversational] unexpected exception from chat_handler: {e}", exc_info=True)
+        reply = "Something went wrong on my end — try once more?"
     await update.message.reply_text(reply)
 
 # ---------------------------------------------------------------------------
