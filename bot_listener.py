@@ -71,6 +71,8 @@ from sessions import (
     close_session,
     get_current_question,
     get_session,
+    clear_chat_session,
+    uk_today,
     db,
 )
 from vault_writeback import write_session_to_vault
@@ -190,6 +192,28 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     close_session(session["id"], final_status="cancelled")
     await update.message.reply_text(_msg(session, "cancel"))
+
+async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/clear - wipe today's Veronica chat memory (v4 Phase 2).
+
+    Touches chat_sessions only — independent of any active scheduled-report
+    session in the `sessions` table, which /cancel handles. CommandHandler
+    matches this before the generic message handler (which is filtered with
+    ~filters.COMMAND), so /clear is never swallowed as a report answer.
+    """
+    if not is_authorised(update):
+        return
+
+    today = uk_today()
+    try:
+        clear_chat_session(today)
+    except Exception as e:
+        log.warning(f"[clear] failed to clear chat session for {today}: {e}")
+        await update.message.reply_text("cleared.")
+        return
+
+    log.info(f"[clear] chat session cleared for {today}")
+    await update.message.reply_text("cleared.")
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/help - show available commands."""
@@ -367,6 +391,7 @@ def main():
     # Command handlers
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("start", cmd_help))
 
