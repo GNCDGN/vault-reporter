@@ -79,6 +79,8 @@ COMPRESSION_MIN_EXCHANGES = 8
 COMPRESSION_MIN_UNSUMMARISED = 5
 COMPRESSION_SHORT_EXCHANGE_CHARS = 100
 COMPRESSION_TIMEOUT = 30          # seconds, per the compression claude call
+DETECTION_TIMEOUT = 20            # Phase 3 Step 2 — checkpoint-worthiness detection
+DETECTION_HINT_LIMIT = 20         # Phase 3 — max distinct project slugs shown to detection
 
 # ---------------------------------------------------------------------------
 # Vault index — Stage 1 input
@@ -377,6 +379,186 @@ def _load_selected_files(paths: list[str]) -> dict[str, str]:
             content = content[:MAX_FILE_CONTENT_CHARS] + "\n\n[... truncated]"
         out[p] = content
     return out
+
+
+def _extract_project_hints(index: list[dict]) -> list[str]:
+    """Phase 3: return the authoritative list of project slugs detection may choose from.
+
+    Sources merged, deduplicated, sorted, capped at DETECTION_HINT_LIMIT:
+    1. Distinct `project:` frontmatter values from checkpoints under
+       01-Projects/second-brain/checkpoints/ (active + archive). Excludes any
+       value containing '/' (filters out accidental sub-path slugs like
+       'second-brain/checkpoints' that shouldn't propagate as canonical slugs).
+    2. Top-level directory names directly under 01-Projects/, so a brand-new
+       project gets a hint slot before its first checkpoint exists.
+
+    Reads from the on-disk vault rather than the in-memory index because the
+    index doesn't carry checkpoint frontmatter or the directory structure we need.
+    Never raises — returns whatever set it could build, even if empty."""
+    slugs: set[str] = set()
+
+    # Source 1: distinct project: values from existing checkpoints
+    try:
+        checkpoint_root = VAULT_PATH / "01-Projects" / "second-brain" / "checkpoints"
+        if checkpoint_root.is_dir():
+            for cp in checkpoint_root.rglob("*.md"):
+                try:
+                    with cp.open("r", encoding="utf-8") as f:
+                        # frontmatter is at the top; we don't need to parse YAML,
+                        # just find the project: line within the first ~30 lines.
+                        for i, line in enumerate(f):
+                            if i > 30:
+                                break
+                            stripped = line.strip()
+                            if stripped.startswith("project:"):
+                                val = stripped.split(":", 1)[1].strip()
+                                # Strip inline comment if any
+                                if "#" in val:
+                                    val = val.split("#", 1)[0].strip()
+                                # Filter out sub-path slugs (contain /), empty, "none"
+                                if val and val != "none" and "/" not in val:
+                                    slugs.add(val)
+                                break
+                except Exception:
+                    continue  # skip unreadable file, keep going
+    except Exception as e:
+        log.warning(f"[chat:detection] hint extraction from checkpoints failed: {e}")
+
+    # Source 2: top-level 01-Projects directory names
+    try:
+        projects_root = VAULT_PATH / "01-Projects"
+        if projects_root.is_dir():
+            for entry in projects_root.iterdir():
+                if entry.is_dir() and not entry.name.startswith("."):
+                    slugs.add(entry.name)
+    except Exception as e:
+        log.warning(f"[chat:detection] hint extraction from 01-Projects failed: {e}")
+
+    result = sorted(slugs)[:DETECTION_HINT_LIMIT]
+    return result
+
+
+# Pre-check gate: ack-shape exact matches (case-insensitive, stripped)
+_DETECTION_ACK_EXACT = {
+    "got it", "noted", "sure thing", "ok", "okay",
+    "thanks", "ta", "cheers",
+}
+# Structural markers — if a short reply contains any of these, it's doing work
+# beyond an acknowledgement, so the ack-shape gate doesn't apply.
+_DETECTION_STRUCTURAL = (":", "?", "→", "—", "because", "so that", "means", "decided")
+
+
+def detect_checkpoint_worthy(
+    user_text: str,
+    assistant_reply: str,
+    selected_paths: list[str],
+    rolling_summary: str,
+    index: list[dict],
+) -> tuple[str, dict | None, str]:
+    """Phase 3 Step 2: decide whether the exchange just completed should be checkpointed.
+
+    Returns one of:
+      ("skip",       None,         reason)   — not checkpoint-worthy (gate or model)
+      ("checkpoint", verdict_dict, "")       — write a checkpoint (Step 3 will act on this)
+      ("error",      None,         err_code) — detection failed; caller treats as skip
+
+    Verdict dict shape on the checkpoint path:
+      {"project": str, "what_changed": str, "why": str, "whats_next": str}
+
+    Never raises. Errors are logged and returned as ("error", None, "...").
+    """
+    # ---- Pre-check gate (deterministic, no model call) ----
+    u = (user_text or "").strip()
+    r = (assistant_reply or "").strip()
+
+    if len(u) < 10:
+        return ("skip", None, "gate:short-user")
+    if len(r) < 40:
+        return ("skip", None, "gate:short-reply")
+    if not selected_paths:
+        return ("skip", None, "gate:no-files")
+    # Ack-shape: short reply that doesn't do structural work
+    r_lower = r.lower()
+    if r_lower in _DETECTION_ACK_EXACT:
+        return ("skip", None, "gate:ack-exact")
+    if len(r) < 40 and not any(m in r_lower for m in _DETECTION_STRUCTURAL):
+        return ("skip", None, "gate:ack-shape")
+
+    # ---- Build the prompt ----
+    try:
+        prompt_path = Path(__file__).parent / "prompts" / "_checkpoint_detection.md"
+        with prompt_path.open("r", encoding="utf-8") as f:
+            prompt_template = f.read()
+    except Exception as e:
+        log.warning(f"[chat:detection] could not load prompt: {e}")
+        return ("error", None, "prompt-load")
+
+    hints = _extract_project_hints(index)
+    if not hints:
+        log.warning("[chat:detection] no project hints available; skipping")
+        return ("skip", None, "gate:no-hints")
+
+    hints_block = "\n".join(hints)
+    summary_block = rolling_summary if rolling_summary else "(no summary yet — this is early in the day or post-/clear)"
+
+    prompt = (
+        prompt_template
+        + "\n\n"
+        + f"<user_message>\n{u}\n</user_message>\n\n"
+        + f"<assistant_reply>\n{r}\n</assistant_reply>\n\n"
+        + f"<rolling_summary>\n{summary_block}\n</rolling_summary>\n\n"
+        + f"<project_hints>\n{hints_block}\n</project_hints>\n\n"
+        + "Decide and emit the output now.\n"
+    )
+
+    # ---- Call claude ----
+    ok, raw = _call_claude_chat(prompt, stage_label="detection", timeout=DETECTION_TIMEOUT)
+    if not ok:
+        return ("error", None, f"call:{raw}")
+
+    # ---- Parse the response ----
+    out = (raw or "").strip()
+    if not out:
+        return ("error", None, "parse:empty")
+
+    # SKIP path: leading SKIP token, optionally followed by trailing whitespace/lines
+    first_line = out.splitlines()[0].strip().upper()
+    if first_line == "SKIP":
+        return ("skip", None, "model")
+    if first_line != "CHECKPOINT":
+        return ("error", None, f"parse:bad-leader:{first_line[:30]}")
+
+    # CHECKPOINT path: parse the four labelled fields
+    fields = {"project": None, "what-changed": None, "why": None, "whats-next": None}
+    for line in out.splitlines()[1:]:
+        stripped = line.rstrip()
+        if not stripped:
+            continue
+        for key in fields:
+            prefix = f"{key}:"
+            if stripped.lower().startswith(prefix):
+                fields[key] = stripped[len(prefix):].strip()
+                break
+
+    missing = [k for k, v in fields.items() if v is None]
+    if missing:
+        return ("error", None, f"parse:missing-fields:{','.join(missing)}")
+
+    # Validate project slug against hints
+    if fields["project"] not in hints:
+        return ("error", None, f"parse:unknown-project:{fields['project']}")
+
+    # Validate non-empty required fields
+    if not fields["project"] or not fields["what-changed"] or not fields["why"]:
+        return ("error", None, "parse:empty-required-field")
+
+    verdict = {
+        "project": fields["project"],
+        "what_changed": fields["what-changed"],
+        "why": fields["why"],
+        "whats_next": fields["whats-next"] or "",
+    }
+    return ("checkpoint", verdict, "")
 
 
 def _render_vault_block(files: dict[str, str]) -> str:
@@ -782,6 +964,72 @@ def run_compression_check(date: str) -> None:
         f"[chat:compression] applied — {len(turns)} turns summarised, "
         f"count now {updated['compression_count']}"
     )
+
+
+# Known error-reply strings (from _error_to_reply outputs). Detection should
+# gate-skip these — they are not real exchanges.
+_DETECTION_ERROR_REPLIES = frozenset({
+    "Hit a timeout on that one — try once more?",
+    "Something went wrong on my end — try once more?",
+    "Got an empty response back — try once more?",
+    "Vault looks empty or unreachable from here — that's a setup problem, not yours.",
+    "Something's wrong with my setup — a prompt file is missing.",
+    "got it — anything to ask?",
+})
+
+
+def run_detection_check(date: str, user_text: str, assistant_reply: str) -> None:
+    """Phase 3 Step 2: background-task entry point for checkpoint-worthiness detection.
+
+    Fire-and-forget. Invoked via asyncio.create_task from bot_listener after the
+    reply has been sent to Telegram. Logs the verdict. Step 2 does NOT write
+    files or modify replies — that's Step 3. Never raises.
+
+    Must be called with the actual text and reply that were just exchanged
+    (not derived from session state) so detection runs on exactly what the
+    user saw.
+    """
+    try:
+        # Gate-skip known error replies immediately — they are not real exchanges
+        if assistant_reply in _DETECTION_ERROR_REPLIES:
+            log.info("[chat:detection] skip (gate:error-reply)")
+            return
+
+        # We need the index and rolling summary; rebuild them. The index is
+        # ~150 files at current vault size — cheap. The session read is also cheap.
+        from sessions import get_chat_session
+        session = get_chat_session(date)
+        rolling = session.get("summary", "") or ""
+
+        # selected_paths isn't available here — we'd need to thread it through
+        # bot_listener, which is invasive. Instead, run the selection again.
+        # This is wasteful but acceptable for Step 2 (logging-only); Step 3
+        # will likely consolidate by passing selected_paths in.
+        index = build_vault_index()
+        if not index:
+            log.info("[chat:detection] skip (gate:no-index)")
+            return
+        selected_paths, status = select_files(user_text, index)
+        if status not in ("ok", "empty"):
+            log.info(f"[chat:detection] skip (gate:stage1-{status})")
+            return
+
+        verdict, data, reason = detect_checkpoint_worthy(
+            user_text, assistant_reply, selected_paths, rolling, index
+        )
+        if verdict == "checkpoint":
+            log.info(
+                f"[chat:detection] checkpoint-worthy: project={data['project']} "
+                f"what-changed={data['what_changed'][:80]!r} "
+                f"why={data['why'][:80]!r} "
+                f"whats-next={data['whats_next'][:80]!r}"
+            )
+        elif verdict == "skip":
+            log.info(f"[chat:detection] skip ({reason})")
+        else:
+            log.warning(f"[chat:detection] error ({reason})")
+    except Exception as e:
+        log.warning(f"[chat:detection] unexpected exception (treated as skip): {e}")
 
 
 # ---------------------------------------------------------------------------

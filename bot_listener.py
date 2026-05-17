@@ -77,7 +77,7 @@ from sessions import (
 )
 from vault_writeback import write_session_to_vault
 from telegram_sender import render_question
-from chat_handler import handle_chat_message, run_compression_check
+from chat_handler import handle_chat_message, run_compression_check, run_detection_check
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -318,6 +318,13 @@ async def _handle_conversational(update: Update, text: str):
     # makes it truly detached. uk_today() is resolved now, at scheduling time.
     asyncio.create_task(
         asyncio.to_thread(run_compression_check, uk_today())
+    )
+    # v4 Phase 3 Step 2: checkpoint-worthiness detection. Same fire-and-forget
+    # pattern as compression — runs after the reply is sent so detection's
+    # claude call never delays the user. text and reply are passed explicitly
+    # so detection runs on exactly what was exchanged, not re-derived state.
+    asyncio.create_task(
+        asyncio.to_thread(run_detection_check, uk_today(), text, reply)
     )
 
 # ---------------------------------------------------------------------------
