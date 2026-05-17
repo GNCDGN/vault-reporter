@@ -9,7 +9,7 @@ Below is a structured context block containing:
 - Yesterday's daily note summary
 - Spanish learning metrics
 - Yesterday's daily briefing (for delta computation)
-- **Checkpoints in the window** — short notes Genco's tools (Claude Code and Claude Desktop) write whenever they make a vault change, capturing the *why* behind each change. These are the primary source for the "What happened" narrative below.
+- **Checkpoints in the window** — short notes Genco's tools write capturing the *why* behind activity. Three sources exist: `claude-code` and `claude-desktop` checkpoints document vault changes at the moment of the change; `claude-veronica-chat` checkpoints document insights, decisions, and commitments from chat conversations with Veronica and do not have a matching git diff (their `files_touched` is empty). The vault-change checkpoints are the primary source for the "What happened" narrative below; chat checkpoints inform interpretation — see the rules below.
 
 ---
 
@@ -42,13 +42,15 @@ The checkpoint notes in the context block are the *most valuable* signal for thi
 
 4. **The "What's next" sections from checkpoints inform the "Things requiring your attention" section.** If yesterday's checkpoints flagged a next step, surface it.
 
-5. **If you see git changes in the context but NO checkpoint covering them, FLAG IT.** Every vault change is supposed to be paired with a `checkpoint this` invocation per the protocol. A missing checkpoint is an invariant violation. Add a short note at the end of "What happened yesterday" saying:
-   > "Note: I see modifications to `<file>` in the git log without a matching checkpoint. The checkpoint protocol expects every vault change to be paired with one. Worth checking whether this was an automated change (Veronica's own write-back), or a missed `checkpoint this` step."
+5. **Chat checkpoints (`source: claude-veronica-chat`) are colour, not subject — usually.** These capture conversations rather than vault changes. They don't pair with git diffs. The default treatment is: use them to interpret why code/desktop checkpoints happened the way they did. If a chat checkpoint at 14:00 records Genco deciding something, and a claude-desktop checkpoint at 14:30 documents the file change that enacts that decision, weave them as one story beat — the chat is the *why*, the desktop is the *what*. **Exception:** if a chat checkpoint preserves an insight or decision that has no corresponding vault change, surface it as its own story beat under "What happened yesterday" — Genco still did something consequential even if no file moved. The "What's next" sections of chat checkpoints feed the "Things requiring your attention" section the same way as any other checkpoint's.
+
+6. **If you see git changes in the context but NO `claude-code` or `claude-desktop` checkpoint covering them, FLAG IT.** Every vault change is supposed to be paired with a `checkpoint this` invocation per the protocol. A missing checkpoint is an invariant violation. The pairing invariant applies only to `claude-code` and `claude-desktop` checkpoints — `claude-veronica-chat` checkpoints don't pair with git changes by design, so they don't count toward satisfying the invariant. Add a short note at the end of "What happened yesterday" saying:
+   > "Note: I see modifications to `<file>` in the git log without a matching code/desktop checkpoint. The checkpoint protocol expects every vault change to be paired with one. Worth checking whether this was an automated change (Veronica's own write-back), or a missed `checkpoint this` step."
    Don't make this dramatic — one short paragraph at most. But don't hide it.
 
-6. **If there are zero checkpoints AND zero git changes, yesterday was quiet.** Say so. One factual paragraph: "Nothing landed in the vault yesterday. No commits, no checkpoints." That's a valid daily.
+7. **If there are zero checkpoints AND zero git changes, yesterday was quiet.** Say so. One factual paragraph: "Nothing landed in the vault yesterday. No commits, no checkpoints." That's a valid daily.
 
-7. **If there are zero checkpoints but there ARE git changes, that's the invariant violation case at scale.** Flag it more prominently — first paragraph of the "What happened" section.
+8. **If there are zero `claude-code` or `claude-desktop` checkpoints but there ARE git changes, that's the invariant violation case at scale.** Flag it more prominently — first paragraph of the "What happened" section. Chat checkpoints don't count toward satisfying the invariant.
 
 ---
 
