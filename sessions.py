@@ -94,14 +94,19 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
     last_compression_at TEXT NOT NULL DEFAULT '',
     compression_count INTEGER NOT NULL DEFAULT 0,
     clear_epoch INTEGER NOT NULL DEFAULT 0,
+    pending_checkpoint_path TEXT NOT NULL DEFAULT '',
+    pending_checkpoint_expiry TEXT NOT NULL DEFAULT '',
+    pending_checkpoint_clear_epoch INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
 """
 
 def init_db():
-    """Create the table if it doesn't exist, and add messages_json column
-    if migrating from an older schema."""
+    """Create tables if they don't exist, and run defensive ALTER TABLE
+    migrations for columns added after the initial schema:
+    - sessions.messages_json (Phase 6+ chat history blob)
+    - chat_sessions.pending_checkpoint_* (Phase 3 skip-window state)"""
     with db() as conn:
         conn.executescript(CREATE_SQL)
         # Defensive migration: older databases predate messages_json.
@@ -112,6 +117,17 @@ def init_db():
             conn.execute(
                 "ALTER TABLE sessions ADD COLUMN messages_json TEXT NOT NULL DEFAULT '{}'"
             )
+
+        # Defensive migration: chat_sessions predates Phase 3 pending-checkpoint columns
+        chat_cols = {row[1] for row in conn.execute("PRAGMA table_info(chat_sessions)")}
+        for col, ddl in [
+            ("pending_checkpoint_path", "TEXT NOT NULL DEFAULT ''"),
+            ("pending_checkpoint_expiry", "TEXT NOT NULL DEFAULT ''"),
+            ("pending_checkpoint_clear_epoch", "INTEGER NOT NULL DEFAULT 0"),
+        ]:
+            if col not in chat_cols:
+                log.info(f"[sessions] migrating: adding {col} column to chat_sessions")
+                conn.execute(f"ALTER TABLE chat_sessions ADD COLUMN {col} {ddl}")
 
 # Run on import — cheap, idempotent, ensures the DB is always ready
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -353,6 +369,18 @@ def _row_to_chat_session(row: sqlite3.Row) -> dict:
             row["clear_epoch"]
             if "clear_epoch" in row.keys() else 0
         ),
+        "pending_checkpoint_path": (
+            row["pending_checkpoint_path"]
+            if "pending_checkpoint_path" in row.keys() else ""
+        ),
+        "pending_checkpoint_expiry": (
+            row["pending_checkpoint_expiry"]
+            if "pending_checkpoint_expiry" in row.keys() else ""
+        ),
+        "pending_checkpoint_clear_epoch": (
+            row["pending_checkpoint_clear_epoch"]
+            if "pending_checkpoint_clear_epoch" in row.keys() else 0
+        ),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -467,7 +495,10 @@ def clear_chat_session(session_date: str) -> dict:
         conn.execute(
             "UPDATE chat_sessions SET messages_json = '[]', summary = '', "
             "unsummarised_turn_count = 0, exchange_count = 0, "
-            "clear_epoch = clear_epoch + 1, updated_at = ? "
+            "clear_epoch = clear_epoch + 1, "
+            "pending_checkpoint_path = '', pending_checkpoint_expiry = '', "
+            "pending_checkpoint_clear_epoch = 0, "
+            "updated_at = ? "
             "WHERE session_date = ?",
             (now, session_date),
         )
@@ -475,6 +506,78 @@ def clear_chat_session(session_date: str) -> dict:
             "SELECT * FROM chat_sessions WHERE session_date = ?", (session_date,)
         ).fetchone()
     return _row_to_chat_session(updated)
+
+def register_pending_checkpoint(session_date: str, file_path: str, expiry_iso: str, clear_epoch: int) -> None:
+    """Record a freshly-written checkpoint as cancellable within its skip window.
+    Overwrites any prior pending state for this date (most-recent-only semantics —
+    if a second checkpoint is registered while one is pending, the older window
+    is dropped, file stays on disk)."""
+    get_chat_session(session_date)  # ensure the row exists
+    now = _uk_now()
+    with db() as conn:
+        conn.execute(
+            "UPDATE chat_sessions SET "
+            "pending_checkpoint_path = ?, pending_checkpoint_expiry = ?, "
+            "pending_checkpoint_clear_epoch = ?, updated_at = ? "
+            "WHERE session_date = ?",
+            (file_path, expiry_iso, clear_epoch, now, session_date),
+        )
+
+def get_pending_checkpoint(session_date: str) -> dict | None:
+    """Return the pending-checkpoint dict if one is registered for this date,
+    None otherwise. Does NOT check expiry — caller decides what to do with
+    expired pending state. Use resolve_pending_checkpoint for the
+    expiry-aware version.
+    Returns: {"path": str, "expiry": str, "clear_epoch": int} or None."""
+    with db() as conn:
+        row = conn.execute(
+            "SELECT pending_checkpoint_path, pending_checkpoint_expiry, "
+            "pending_checkpoint_clear_epoch FROM chat_sessions "
+            "WHERE session_date = ?",
+            (session_date,),
+        ).fetchone()
+    if row is None or not row[0]:
+        return None
+    return {"path": row[0], "expiry": row[1], "clear_epoch": row[2]}
+
+def clear_pending_checkpoint(session_date: str) -> None:
+    """Clear pending-checkpoint state. Does NOT delete the file on disk.
+    Used by the skip handler (after deleting the file), the expiry handler
+    (when the 60s window passes), and any other code path that needs to
+    drop the pending registration without touching the vault."""
+    now = _uk_now()
+    with db() as conn:
+        conn.execute(
+            "UPDATE chat_sessions SET "
+            "pending_checkpoint_path = '', pending_checkpoint_expiry = '', "
+            "pending_checkpoint_clear_epoch = 0, updated_at = ? "
+            "WHERE session_date = ?",
+            (now, session_date),
+        )
+
+def resolve_pending_checkpoint(session_date: str, now_iso: str) -> tuple[str, dict | None]:
+    """Single-call helper for the skip handler. Returns one of:
+      ("active", {path, expiry, clear_epoch})  — still cancellable
+      ("expired", {path, expiry, clear_epoch}) — window passed; state cleared as side effect
+      ("none", None)                           — no pending state
+    Expiry comparison is lexicographic on ISO8601 UTC, which is correct."""
+    pending = get_pending_checkpoint(session_date)
+    if pending is None:
+        return ("none", None)
+    if now_iso > pending["expiry"]:
+        clear_pending_checkpoint(session_date)
+        return ("expired", pending)
+    return ("active", pending)
+
+def is_pending_within_clear_epoch(session_date: str, current_epoch: int) -> bool:
+    """Race-protection helper for the skip handler.
+    Returns True if a pending checkpoint exists AND its captured clear_epoch
+    matches the current one (no /clear has intervened since registration).
+    Returns False otherwise (no pending, OR /clear bumped the epoch)."""
+    pending = get_pending_checkpoint(session_date)
+    if pending is None:
+        return False
+    return pending["clear_epoch"] == current_epoch
 
 def update_chat_summary(session_date: str, new_summary: str) -> dict:
     """Overwrite the rolling summary and reset unsummarised_turn_count to 0.
@@ -617,6 +720,12 @@ def _cli():
                 role = m.get("role", "?")
                 content = m.get("content", "")
                 print(f"[{ts}] {role}: {content}")
+        if s.get("pending_checkpoint_path"):
+            print()
+            print("pending checkpoint:")
+            print(f"  path: {s['pending_checkpoint_path']}")
+            print(f"  expiry: {s['pending_checkpoint_expiry']}")
+            print(f"  clear_epoch_at_register: {s['pending_checkpoint_clear_epoch']}")
 
     elif cmd == "chat_clear":
         clear_chat_session(_uk_today())
