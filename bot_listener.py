@@ -323,8 +323,9 @@ async def _handle_conversational(update: Update, text: str):
     # pattern as compression — runs after the reply is sent so detection's
     # claude call never delays the user. text and reply are passed explicitly
     # so detection runs on exactly what was exchanged, not re-derived state.
+    chat_id = update.effective_chat.id
     asyncio.create_task(
-        asyncio.to_thread(run_detection_check, uk_today(), text, reply)
+        asyncio.to_thread(run_detection_check, uk_today(), text, reply, chat_id)
     )
 
 # ---------------------------------------------------------------------------

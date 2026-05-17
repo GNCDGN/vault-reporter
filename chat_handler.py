@@ -31,6 +31,7 @@ import os
 import sys
 import logging
 import subprocess
+import re
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -81,6 +82,10 @@ COMPRESSION_SHORT_EXCHANGE_CHARS = 100
 COMPRESSION_TIMEOUT = 30          # seconds, per the compression claude call
 DETECTION_TIMEOUT = 20            # Phase 3 Step 2 — checkpoint-worthiness detection
 DETECTION_HINT_LIMIT = 20         # Phase 3 — max distinct project slugs shown to detection
+CHECKPOINT_SKIP_WINDOW_SECS = 60   # Phase 3 — how long after writing a checkpoint Genco can `skip`
+CHECKPOINT_SLUG_MAX_LEN = 60       # Phase 3 — max chars in filename slug derived from what-changed
+CHECKPOINT_EXCERPT_USER_MAX = 400  # Phase 3 — truncate user_text in checkpoint body to this many chars
+CHECKPOINT_EXCERPT_REPLY_MAX = 600 # Phase 3 — truncate assistant_reply in checkpoint body
 
 # ---------------------------------------------------------------------------
 # Vault index — Stage 1 input
@@ -561,6 +566,164 @@ def detect_checkpoint_worthy(
     return ("checkpoint", verdict, "")
 
 
+def _slug_from_text(text: str) -> str:
+    """Build a kebab-case filename slug from `text`.
+    Rules: lowercase, non-alphanumerics → '-', collapse runs of '-', strip
+    edges, cap at CHECKPOINT_SLUG_MAX_LEN chars (cutting at a '-' boundary
+    where possible so we don't end mid-word).
+    Returns 'untitled' if the input is empty after cleaning."""
+    if not text:
+        return "untitled"
+    s = re.sub(r"[^a-z0-9]+", "-", text.lower())
+    s = re.sub(r"-+", "-", s).strip("-")
+    if not s:
+        return "untitled"
+    if len(s) > CHECKPOINT_SLUG_MAX_LEN:
+        s = s[:CHECKPOINT_SLUG_MAX_LEN]
+        # If we cut mid-word, walk back to the last hyphen
+        last = s.rfind("-")
+        if last > 20:  # only walk back if we'd still have a reasonable length
+            s = s[:last]
+        s = s.strip("-")
+    return s or "untitled"
+
+
+def _truncate_excerpt(text: str, max_chars: int) -> str:
+    """Truncate `text` to max_chars. If truncated, append ' … [truncated]'."""
+    t = (text or "").strip()
+    if len(t) <= max_chars:
+        return t
+    return t[:max_chars].rstrip() + " … [truncated]"
+
+
+def _write_checkpoint_file(
+    verdict: dict,
+    user_text: str,
+    assistant_reply: str,
+) -> tuple[str, str] | None:
+    """Phase 3 Step 3: write a Veronica chat checkpoint to the vault.
+
+    Returns (vault_relative_path, absolute_path) on success, None on failure.
+    Never raises. The file lands under
+    01-Projects/second-brain/checkpoints/active/ following the existing
+    naming convention: YYYY-MM-DD-HHMM-<slug>.md (no source prefix —
+    `source: claude-veronica-chat` in frontmatter is the canonical marker).
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    try:
+        now_uk = datetime.now(ZoneInfo("Europe/London"))
+        date_str = now_uk.strftime("%Y-%m-%d")
+        time_str = now_uk.strftime("%H:%M")
+        ts_str = now_uk.strftime("%Y-%m-%d-%H%M")
+
+        slug = _slug_from_text(verdict["what_changed"])
+        filename = f"{ts_str}-{slug}.md"
+        rel_path = f"01-Projects/second-brain/checkpoints/active/{filename}"
+        abs_path = VAULT_PATH / "01-Projects" / "second-brain" / "checkpoints" / "active" / filename
+
+        user_excerpt = _truncate_excerpt(user_text, CHECKPOINT_EXCERPT_USER_MAX)
+        reply_excerpt = _truncate_excerpt(assistant_reply, CHECKPOINT_EXCERPT_REPLY_MAX)
+
+        # Pick a title for the H1 — use the first sentence of what_changed, capped at ~80 chars
+        what_changed = verdict["what_changed"].strip()
+        title = what_changed.split(".")[0].strip()
+        if len(title) > 80:
+            title = title[:80].rsplit(" ", 1)[0] + "…"
+
+        whats_next_value = verdict.get("whats_next", "").strip()
+        whats_next_rendered = whats_next_value if whats_next_value else "(none named in this exchange)"
+
+        content = (
+            "---\n"
+            f"date: '{date_str}'\n"
+            f"time: '{time_str}'\n"
+            "type: checkpoint\n"
+            "source: claude-veronica-chat\n"
+            f"project: {verdict['project']}\n"
+            "files_touched: []\n"
+            "git_commit: null\n"
+            "archive_after: null\n"
+            "archived_by: null\n"
+            "tags:\n"
+            "  - checkpoint\n"
+            f"  - {verdict['project']}\n"
+            "  - veronica-chat\n"
+            "author: claude\n"
+            "---\n"
+            "\n"
+            f"# Checkpoint — {title}\n"
+            "\n"
+            "## What changed\n"
+            "\n"
+            f"{verdict['what_changed'].strip()}\n"
+            "\n"
+            f"> **From the chat at {time_str}:**\n"
+            "> \n"
+            f"> **Genco:** {user_excerpt}\n"
+            "> \n"
+            f"> **Veronica:** {reply_excerpt}\n"
+            "\n"
+            "## Why\n"
+            "\n"
+            f"{verdict['why'].strip()}\n"
+            "\n"
+            "## What's next\n"
+            "\n"
+            f"{whats_next_rendered}\n"
+        )
+
+        abs_path.parent.mkdir(parents=True, exist_ok=True)
+        with abs_path.open("w", encoding="utf-8") as f:
+            f.write(content)
+
+        log.info(f"[chat:detection] wrote checkpoint: {rel_path}")
+        return (rel_path, str(abs_path))
+    except Exception as e:
+        log.warning(f"[chat:detection] checkpoint write failed: {e}")
+        return None
+
+
+def _send_telegram_followup(chat_id: int, text: str) -> bool:
+    """Phase 3 Step 3: send a follow-up message to the Telegram chat via direct
+    HTTPS POST to sendMessage. Used to deliver the italic checkpoint-footer
+    line after the file has been written.
+
+    Reads TELEGRAM_BOT_TOKEN from env. Fails closed (returns False) if the
+    token is missing or the API call fails — the checkpoint file and pending
+    state still stand; the user just doesn't see the inline signal.
+
+    Returns True on success, False otherwise. Never raises.
+    """
+    import os
+    import urllib.request
+    import urllib.parse
+    import json
+    try:
+        token = os.environ.get("TELEGRAM_BOT_TOKEN")
+        if not token:
+            log.warning("[chat:detection] TELEGRAM_BOT_TOKEN missing; cannot send followup")
+            return False
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        # Markdown V1: _text_ renders as italic.
+        data = urllib.parse.urlencode({
+            "chat_id": str(chat_id),
+            "text": text,
+            "parse_mode": "Markdown",
+        }).encode("utf-8")
+        req = urllib.request.Request(url, data=data, method="POST")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = resp.read().decode("utf-8")
+            parsed = json.loads(body)
+            if not parsed.get("ok"):
+                log.warning(f"[chat:detection] telegram followup not ok: {body[:200]}")
+                return False
+        return True
+    except Exception as e:
+        log.warning(f"[chat:detection] telegram followup failed: {e}")
+        return False
+
+
 def _render_vault_block(files: dict[str, str]) -> str:
     """Wrap each loaded file in a <vault_file path="..."> ... </vault_file> block."""
     if not files:
@@ -978,7 +1141,7 @@ _DETECTION_ERROR_REPLIES = frozenset({
 })
 
 
-def run_detection_check(date: str, user_text: str, assistant_reply: str) -> None:
+def run_detection_check(date: str, user_text: str, assistant_reply: str, chat_id: int | None = None) -> None:
     """Phase 3 Step 2: background-task entry point for checkpoint-worthiness detection.
 
     Fire-and-forget. Invoked via asyncio.create_task from bot_listener after the
@@ -1024,6 +1187,33 @@ def run_detection_check(date: str, user_text: str, assistant_reply: str) -> None
                 f"why={data['why'][:80]!r} "
                 f"whats-next={data['whats_next'][:80]!r}"
             )
+
+            # Capture clear_epoch BEFORE writing so a /clear racing this
+            # write can be detected by Step 4's skip handler. The Step 1
+            # helper register_pending_checkpoint will store this snapshot.
+            from sessions import get_clear_epoch, register_pending_checkpoint
+            captured_epoch = get_clear_epoch(date)
+
+            written = _write_checkpoint_file(data, user_text, assistant_reply)
+            if written is None:
+                log.warning("[chat:detection] checkpoint write failed; skipping pending state and followup")
+                return
+            rel_path, _abs_path = written
+
+            # Register pending state with the 60-second skip window
+            from datetime import datetime, timedelta, timezone
+            expiry = (datetime.now(timezone.utc) + timedelta(seconds=CHECKPOINT_SKIP_WINDOW_SECS)).isoformat()
+            try:
+                register_pending_checkpoint(date, rel_path, expiry, captured_epoch)
+            except Exception as e:
+                log.warning(f"[chat:detection] register_pending_checkpoint failed: {e}; file remains, no window")
+
+            # Telegram followup — fails closed
+            if chat_id is not None:
+                _send_telegram_followup(chat_id, "_checkpointed that — reply skip to drop_")
+            else:
+                log.warning("[chat:detection] no chat_id provided; followup not sent")
+            return
         elif verdict == "skip":
             log.info(f"[chat:detection] skip ({reason})")
         else:
