@@ -724,6 +724,34 @@ def _send_telegram_followup(chat_id: int, text: str) -> bool:
         return False
 
 
+def delete_checkpoint_file(rel_path: str) -> bool:
+    """Phase 3 Step 4: delete a checkpoint file by vault-relative path.
+
+    Used by the skip handler. Returns True on success or if the file was
+    already absent (idempotent). Returns False on actual errors (permission,
+    OS error). Never raises.
+
+    Defensive: only deletes files under
+    01-Projects/second-brain/checkpoints/active/ to limit blast radius if
+    a malformed path somehow reaches this function.
+    """
+    try:
+        # Defensive containment — only operate under the active checkpoints folder
+        if not rel_path.startswith("01-Projects/second-brain/checkpoints/active/"):
+            log.warning(f"[chat:skip] refusing to delete path outside active checkpoints: {rel_path}")
+            return False
+        abs_path = VAULT_PATH / rel_path
+        if not abs_path.exists():
+            log.warning(f"[chat:skip] checkpoint file already absent: {rel_path}")
+            return True  # idempotent — nothing to delete is treated as success
+        abs_path.unlink()
+        log.info(f"[chat:skip] deleted checkpoint: {rel_path}")
+        return True
+    except Exception as e:
+        log.warning(f"[chat:skip] checkpoint delete failed for {rel_path}: {e}")
+        return False
+
+
 def _render_vault_block(files: dict[str, str]) -> str:
     """Wrap each loaded file in a <vault_file path="..."> ... </vault_file> block."""
     if not files:

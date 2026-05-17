@@ -73,11 +73,15 @@ from sessions import (
     get_session,
     clear_chat_session,
     uk_today,
+    resolve_pending_checkpoint,
+    is_pending_within_clear_epoch,
+    get_clear_epoch,
+    clear_pending_checkpoint,
     db,
 )
 from vault_writeback import write_session_to_vault
 from telegram_sender import render_question
-from chat_handler import handle_chat_message, run_compression_check, run_detection_check
+from chat_handler import handle_chat_message, run_compression_check, run_detection_check, delete_checkpoint_file
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -251,6 +255,41 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     session = get_active_session()
     if not session:
+        # Phase 3 Step 4 — checkpoint skip handler. Fires before conversational
+        # routing because "skip" is the protocol token for cancelling a
+        # just-written checkpoint inside its 60s window. Falls through if no
+        # pending state, expired, or the clear_epoch has drifted (a /clear
+        # landed mid-window). Does NOT fire when an active Q&A session is
+        # in progress — Q&A reserves "skip" for skipping the current question.
+        if text.strip().lower() == "skip":
+            from datetime import datetime, timezone
+            today = uk_today()
+            now_iso = datetime.now(timezone.utc).isoformat()
+            state, pending = resolve_pending_checkpoint(today, now_iso)
+            if state == "active":
+                # Race-check against /clear
+                current_epoch = get_clear_epoch(today)
+                if is_pending_within_clear_epoch(today, current_epoch):
+                    rel_path = pending["path"]
+                    deleted = delete_checkpoint_file(rel_path)
+                    clear_pending_checkpoint(today)
+                    if deleted:
+                        log.info(f"[chat:skip] dropped pending checkpoint: {rel_path}")
+                        await update.message.reply_text("dropped that checkpoint.")
+                    else:
+                        log.warning(f"[chat:skip] delete failed but state cleared: {rel_path}")
+                        await update.message.reply_text("dropped that checkpoint.")
+                    return
+                else:
+                    log.info(f"[chat:skip] fell through (clear-drifted): {pending['path']}")
+            elif state == "expired":
+                log.info(f"[chat:skip] fell through (expired): {pending['path']}")
+            else:
+                # state == "none" — no pending checkpoint, nothing to log here;
+                # fall through silently to conversational. "skip" is just a
+                # word in this case.
+                pass
+
         # No active session — route to the conversational placeholder.
         # Future: this is where the ad-hoc vault assistant lives.
         await _handle_conversational(update, text)
