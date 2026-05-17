@@ -596,6 +596,17 @@ def _truncate_excerpt(text: str, max_chars: int) -> str:
     return t[:max_chars].rstrip() + " … [truncated]"
 
 
+def _blockquote_lines(text: str) -> str:
+    """Prepend '> ' to every line of `text`, so the entire string renders
+    as a single contiguous blockquote in Markdown. Empty lines become bare '>'
+    (a blank line inside a blockquote in CommonMark / Obsidian Markdown).
+    The first line is also prefixed — caller must NOT pre-prepend '> '."""
+    if not text:
+        return ""
+    lines = text.split("\n")
+    return "\n".join(f"> {line}" if line else ">" for line in lines)
+
+
 def _write_checkpoint_file(
     verdict: dict,
     user_text: str,
@@ -659,10 +670,10 @@ def _write_checkpoint_file(
             f"{verdict['what_changed'].strip()}\n"
             "\n"
             f"> **From the chat at {time_str}:**\n"
-            "> \n"
-            f"> **Genco:** {user_excerpt}\n"
-            "> \n"
-            f"> **Veronica:** {reply_excerpt}\n"
+            ">\n"
+            f"{_blockquote_lines(f'**Genco:** {user_excerpt}')}\n"
+            ">\n"
+            f"{_blockquote_lines(f'**Veronica:** {reply_excerpt}')}\n"
             "\n"
             "## Why\n"
             "\n"
