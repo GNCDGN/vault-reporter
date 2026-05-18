@@ -1191,10 +1191,35 @@ def run_detection_check(date: str, user_text: str, assistant_reply: str, chat_id
     (not derived from session state) so detection runs on exactly what the
     user saw.
     """
+    # Phase 4a: exactly one chat_detection_log row per detection. `logged`
+    # is a function-local bool, False at entry, set True the moment a row
+    # write is ATTEMPTED (append_detection_log swallows its own errors —
+    # the attempt is what the once-guard counts, not its success). The
+    # catch-all except below emits an error row only `if not logged`, so a
+    # detection that died before any terminal path still yields one row and
+    # one that already logged is never double-counted. The multiple early
+    # returns make this flag load-bearing — do not collapse it away.
+    logged = False
+
+    def _emit(verdict, reason, *, gate_fired="", model_invoked=0,
+              model_verdict=""):
+        nonlocal logged
+        logged = True  # attempt registered; keeps exactly-once across paths
+        try:
+            from sessions import append_detection_log
+            from datetime import datetime, timezone
+            append_detection_log(
+                date, datetime.now(timezone.utc).isoformat(),
+                verdict, reason, gate_fired, model_invoked, model_verdict,
+            )
+        except Exception as e:  # detection stays never-raising
+            log.warning(f"[chat:detection-log] emit failed (non-fatal): {e}")
+
     try:
         # Gate-skip known error replies immediately — they are not real exchanges
         if assistant_reply in _DETECTION_ERROR_REPLIES:
             log.info("[chat:detection] skip (gate:error-reply)")
+            _emit("skip", "gate:error-reply", gate_fired="gate:error-reply")
             return
 
         # We need the index and rolling summary; rebuild them. The index is
@@ -1210,10 +1235,13 @@ def run_detection_check(date: str, user_text: str, assistant_reply: str, chat_id
         index = build_vault_index()
         if not index:
             log.info("[chat:detection] skip (gate:no-index)")
+            _emit("skip", "gate:no-index", gate_fired="gate:no-index")
             return
         selected_paths, status = select_files(user_text, index)
         if status not in ("ok", "empty"):
             log.info(f"[chat:detection] skip (gate:stage1-{status})")
+            _emit("skip", f"gate:stage1-{status}",
+                  gate_fired=f"gate:stage1-{status}")
             return
 
         verdict, data, reason = detect_checkpoint_worthy(
@@ -1226,6 +1254,8 @@ def run_detection_check(date: str, user_text: str, assistant_reply: str, chat_id
                 f"why={data['why'][:80]!r} "
                 f"whats-next={data['whats_next'][:80]!r}"
             )
+            _emit("checkpoint", "model", model_invoked=1,
+                  model_verdict="checkpoint")
 
             # Capture clear_epoch BEFORE writing so a /clear racing this
             # write can be detected by Step 4's skip handler. The Step 1
@@ -1255,10 +1285,24 @@ def run_detection_check(date: str, user_text: str, assistant_reply: str, chat_id
             return
         elif verdict == "skip":
             log.info(f"[chat:detection] skip ({reason})")
+            _emit(
+                "skip", reason,
+                gate_fired=reason if reason.startswith("gate:") else "",
+                model_invoked=1 if reason == "model" else 0,
+                model_verdict="skip" if reason == "model" else "",
+            )
         else:
             log.warning(f"[chat:detection] error ({reason})")
+            _emit(
+                "error", reason,
+                model_invoked=(
+                    1 if reason.startswith(("call:", "parse:")) else 0
+                ),
+            )
     except Exception as e:
         log.warning(f"[chat:detection] unexpected exception (treated as skip): {e}")
+        if not logged:
+            _emit("error", f"exception:{type(e).__name__}")
 
 
 # ---------------------------------------------------------------------------

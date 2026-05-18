@@ -100,6 +100,18 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS chat_detection_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_date TEXT NOT NULL,
+    ts TEXT NOT NULL,
+    verdict TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    gate_fired TEXT NOT NULL DEFAULT '',
+    model_invoked INTEGER NOT NULL DEFAULT 0,
+    model_verdict TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
 """
 
 def init_db():
@@ -663,6 +675,42 @@ def apply_compression(
             "SELECT * FROM chat_sessions WHERE session_date = ?", (session_date,)
         ).fetchone()
     return _row_to_chat_session(updated)
+
+# ---------------------------------------------------------------------------
+# Detection log (v4 Phase 4a — checkpoint-promotion calibration)
+# ---------------------------------------------------------------------------
+
+def append_detection_log(
+    session_date: str,
+    ts: str,
+    verdict: str,
+    reason: str,
+    gate_fired: str = "",
+    model_invoked: int = 0,
+    model_verdict: str = "",
+) -> None:
+    """Append one row recording a detection verdict. One row per detection,
+    written by chat_handler.run_detection_check.
+
+    Never raises: a logging-write failure is non-fatal and logged, so
+    detection stays never-raising and fire-and-forget. Mirrors the Phase 2
+    [chat:persist] precedent — measurement must not break the path it
+    measures."""
+    try:
+        now = _uk_now()
+        with db() as conn:
+            conn.execute(
+                "INSERT INTO chat_detection_log "
+                "(session_date, ts, verdict, reason, gate_fired, "
+                "model_invoked, model_verdict, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session_date, ts, verdict, reason, gate_fired,
+                    model_invoked, model_verdict, now,
+                ),
+            )
+    except Exception as e:
+        log.warning(f"[chat:detection-log] write failed (non-fatal): {e}")
 
 # ---------------------------------------------------------------------------
 # CLI inspection
