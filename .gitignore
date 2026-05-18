@@ -4,3 +4,4 @@ __pycache__/
 .vault-reporter-state.json
 *.log
 .DS_Store
+reporter
